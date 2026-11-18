@@ -28,5 +28,6 @@ runs/
 .vscode/
 .DS_Store
 
-# Chatty backups
-.chatty/
+# Chatty runtime data (keep the committed system_prompt/)
+.chatty/*
+!.chatty/system_prompt/

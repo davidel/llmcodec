@@ -35,7 +35,7 @@ data = [
 dev = [
     "pytest>=7.0",
     "pytest-cov>=4.0",
-    "black>=23.0",
+    "yapf>=0.40",
     "ruff>=0.4",
 ]
 all = ["llmcodec[data,dev]"]
@@ -60,14 +60,11 @@ markers = [
     "slow: tests that train a model or require the network",
 ]
 
-[tool.black]
-line-length = 100
-target-version = ["py310"]
-
+# Formatting is handled by yapf, configured in .style.yapf (Google style,
+# 2-space indent, 88-column limit).  Ruff is used for linting only.
 [tool.ruff]
-line-length = 100
+line-length = 88
 target-version = "py310"
 
 [tool.ruff.lint]
-select = ["E", "F", "I", "UP", "B"]
-ignore = ["E501"]
+select = ["E", "F", "I"]

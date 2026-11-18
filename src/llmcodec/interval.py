@@ -1,145 +1,217 @@
-"""Exact rational interval arithmetic used by the codec.
+"""Exact rational interval arithmetic for the codec.
 
 The codec represents the current probability interval as an exact rational
-interval ``[num_lo / den, num_hi / den]`` rather than a pair of floats.  This
-keeps encoding/decoding *exactly* invertible no matter how deep the recursion
-goes: floating point rounding would otherwise make the recovered interval drift
-away from the encoded one.
+interval ``[num_lo / den, num_hi / den]`` rather than a pair of floating point
+numbers.  Floating point rounding would accumulate over the many subdivision
+steps of a sentence and let the interval recovered during decoding drift away
+from the one produced during encoding; exact arithmetic removes that failure
+mode entirely, so encoding and decoding are perfectly inverse.
 
-Sub-slices have widths proportional to the (normalized) next-token
-probabilities, so they are generally *not* equal.  Subdivision therefore takes
-a list of integer *counts* (one per candidate token); the ``i``-th slice spans
-the fraction ``[prefix_i / total, prefix_{i+1} / total]`` of the current
-interval, where ``prefix`` are the cumulative counts and ``total`` their sum.
+Each coding step splits the current interval into one slice per candidate token,
+with slice widths proportional to the (integer) candidate weights.  Because the
+weights are arbitrary integers, the slices are generally *unequal*, so
+subdivision cannot be expressed with a single numerator.  Instead,
+:meth:`Interval.subdivide` takes the full list of weights and the index of the
+desired slice, and computes the slice boundaries from the normalized cumulative
+weights.
 
-Every constructor reduces the fraction by the gcd of its three integers, which
-keeps the numbers from growing without bound while preserving the represented
-interval exactly.
+Every interval is stored in lowest terms: the constructor reduces the triple
+``(num_lo, num_hi, den)`` by their greatest common divisor.  This keeps the
+integers small without changing the represented interval, which matters because
+the denominator otherwise grows by a factor of ``sum(weights)`` at every step.
 """
 
-from __future__ import annotations
-
-from collections.abc import Sequence
-from dataclasses import dataclass
+from collections import namedtuple
 from fractions import Fraction
 from math import gcd
 
 
-@dataclass(frozen=True)
-class Interval:
-    """The closed rational interval ``[num_lo / den, num_hi / den]``.
+class Interval(namedtuple("Interval", "num_lo num_hi den")):
+  """A closed rational interval ``[num_lo / den, num_hi / den]``.
 
-    Invariants: ``den > 0`` and ``0 <= num_lo <= num_hi <= den``.
+  The interval is immutable and normalized to lowest terms.  All three fields
+  are integers and satisfy ``den > 0`` and ``0 <= num_lo <= num_hi <= den``, so
+  every interval lies inside ``[0, 1]``.
+
+  Attributes:
+    num_lo: Numerator of the (inclusive) lower bound.
+    num_hi: Numerator of the (inclusive) upper bound.
+    den: Common denominator, strictly positive.
+  """
+
+  __slots__ = ()
+
+  def __new__(cls, num_lo, num_hi, den):
+    """Validate the invariants and build the interval.
+
+    Raises:
+      ValueError: If the denominator is not positive, the bounds are inverted,
+        or the interval falls outside ``[0, 1]``.
     """
+    if den <= 0:
+      raise ValueError("denominator must be positive")
+    if num_lo > num_hi:
+      raise ValueError("lower bound must not exceed upper bound")
+    if num_lo < 0 or num_hi > den:
+      raise ValueError("interval must lie inside [0, 1]")
+    return super().__new__(cls, num_lo, num_hi, den)
 
-    num_lo: int
-    num_hi: int
-    den: int
+  @classmethod
+  def unit(cls):
+    """Return the full interval ``[0, 1]``.
 
-    def __post_init__(self) -> None:
-        if self.den <= 0:
-            raise ValueError("denominator must be positive")
-        if self.num_lo > self.num_hi:
-            raise ValueError("lower bound must not exceed upper bound")
-        if self.num_lo < 0 or self.num_hi > self.den:
-            raise ValueError("interval must lie inside [0, 1]")
+    This is the starting interval for both encoding and decoding.
+    """
+    return cls(0, 1, 1)
 
-    # -- constructors --------------------------------------------------------
-    @classmethod
-    def unit(cls) -> Interval:
-        """The full ``[0, 1]`` interval."""
-        return cls(0, 1, 1)
+  @classmethod
+  def _reduce(cls, num_lo, num_hi, den):
+    """Construct an interval reduced to lowest terms.
 
-    @classmethod
-    def _make(cls, num_lo: int, num_hi: int, den: int) -> Interval:
-        """Build a reduced interval."""
-        g = gcd(gcd(num_lo, num_hi), den)
-        if g > 1:
-            num_lo, num_hi, den = num_lo // g, num_hi // g, den // g
-        return cls(num_lo, num_hi, den)
+    Args:
+      num_lo: Numerator of the lower bound.
+      num_hi: Numerator of the upper bound.
+      den: Common denominator.
 
-    @classmethod
-    def from_fraction(cls, value: Fraction, den: int) -> Interval:
-        """Build the unit interval (of width ``1/den``) containing ``value``.
+    Returns:
+      The equivalent interval with ``gcd(num_lo, num_hi, den)`` divided out.
+    """
+    g = gcd(gcd(num_lo, num_hi), den)
+    if g > 1:
+      num_lo, num_hi, den = num_lo // g, num_hi // g, den // g
+    return cls(num_lo, num_hi, den)
 
-        The result is the largest interval of the requested resolution that
-        contains ``value``.
-        """
-        if not (0 <= value <= 1):
-            raise ValueError("value must lie in [0, 1]")
-        scaled = value * den
-        k = int(scaled)  # floor
-        if k == den:  # value == 1 -> the last unit interval
-            k = den - 1
-        return cls(k, k + 1, den)
+  @classmethod
+  def from_fraction(cls, value, den):
+    """Return the unit interval of width ``1 / den`` that contains ``value``.
 
-    # -- value accessors -----------------------------------------------------
-    @property
-    def lower(self) -> Fraction:
-        return Fraction(self.num_lo, self.den)
+    This is used to *quantize* an arbitrary real back onto the codec's grid,
+    for example when a caller supplies a code as a plain float or fraction.
 
-    @property
-    def upper(self) -> Fraction:
-        return Fraction(self.num_hi, self.den)
+    Args:
+      value: A rational number in ``[0, 1]``.
+      den: The resolution (number of unit intervals across ``[0, 1]``).
 
-    @property
-    def width(self) -> Fraction:
-        return Fraction(self.num_hi - self.num_lo, self.den)
+    Returns:
+      The largest interval of width ``1 / den`` whose interior contains
+      ``value``.  A value of exactly ``1`` maps to the last unit interval.
 
-    def midpoint(self) -> Fraction:
-        """The center of the interval -- the value emitted when encoding."""
-        return Fraction(self.num_lo + self.num_hi, 2 * self.den)
+    Raises:
+      ValueError: If ``value`` lies outside ``[0, 1]``.
+    """
+    if not (0 <= value <= 1):
+      raise ValueError("value must lie in [0, 1]")
+    scaled = value * den
+    k = int(scaled)  # floor of value * den
+    if k == den:  # value == 1 -> the last unit interval
+      k = den - 1
+    return cls(k, k + 1, den)
 
-    def contains(self, value: Fraction) -> bool:
-        return self.lower <= value <= self.upper
+  @property
+  def lower(self):
+    """The inclusive lower bound as a :class:`~fractions.Fraction`."""
+    return Fraction(self.num_lo, self.den)
 
-    # -- subdivision ---------------------------------------------------------
-    def subdivide(self, counts: Sequence[int], index: int) -> Interval:
-        """Return the ``index``-th slice of ``self`` under integer ``counts``.
+  @property
+  def upper(self):
+    """The inclusive upper bound as a :class:`~fractions.Fraction`."""
+    return Fraction(self.num_hi, self.den)
 
-        ``counts[i]`` is the (integer) weight of candidate ``i``; the slice
-        boundaries sit at the normalized cumulative weights.
-        """
-        if not counts:
-            raise ValueError("counts must be non-empty")
-        if any(c < 0 for c in counts):
-            raise ValueError("counts must be non-negative")
-        if sum(counts) <= 0:
-            raise ValueError("total weight must be positive")
-        if not (0 <= index < len(counts)):
-            raise ValueError(f"index {index} out of range for {len(counts)} slices")
+  @property
+  def width(self):
+    """The width ``upper - lower`` as a :class:`~fractions.Fraction`.
 
-        total = sum(counts)
-        prefix = sum(counts[:index])
-        span = self.num_hi - self.num_lo
-        lo = self.num_lo * total + prefix * span
-        hi = self.num_lo * total + (prefix + counts[index]) * span
-        return Interval._make(lo, hi, self.den * total)
+    The width is a natural measure of how "uncertain" the code still is: a
+    wider interval means fewer bits of information have been committed, which is
+    what a well-trained language model achieves for likely sentences.
+    """
+    return Fraction(self.num_hi - self.num_lo, self.den)
 
-    def find_slice(self, counts: Sequence[int], value: Fraction) -> int:
-        """Return the index of the slice containing ``value``.
+  def midpoint(self):
+    """Return the center of the interval.
 
-        Slices are treated as half-open ``[boundary_i, boundary_{i+1})`` so the
-        mapping agrees with the encoder's cumulative-weight lookup.  The final
-        slice is closed on the right so that ``value == 1`` is always resolved.
-        """
-        if not self.contains(value):
-            raise ValueError("value lies outside the interval")
-        total = sum(counts)
-        span = self.num_hi - self.num_lo
-        if span == 0:
-            raise ValueError("cannot subdivide a zero-width interval")
+    The encoder emits this value as the final code.  Any point strictly inside
+    the interval decodes to the same sentence, so the midpoint is a robust
+    choice that stays as far as possible from the boundaries.
+    """
+    return Fraction(self.num_lo + self.num_hi, 2 * self.den)
 
-        # Position of ``value`` within ``self`` in units of ``1/total``.
-        pos = (value - self.lower) * total / self.width
-        cumulative = 0
-        for i, c in enumerate(counts):
-            nxt = cumulative + c
-            if pos < nxt or i == len(counts) - 1:
-                return i
-            cumulative = nxt
-        return len(counts) - 1  # pragma: no cover - defensive
+  def contains(self, value):
+    """Return whether ``value`` lies within the closed interval."""
+    return self.lower <= value <= self.upper
 
-    def __repr__(self) -> str:  # pragma: no cover - cosmetic
-        lo, hi = float(self.lower), float(self.upper)
-        return f"Interval([{lo:.6f}, {hi:.6f}] = {self.num_lo}/{self.num_hi}/{self.den})"
+  def subdivide(self, counts, index):
+    """Return the ``index``-th slice of ``self`` under integer ``counts``.
+
+    The slice boundaries sit at the normalized cumulative weights: with total
+    weight ``T = sum(counts)``, slice ``i`` spans ``[p_i / T, p_{i+1} / T]`` of
+    ``self``, where ``p_i = sum(counts[:i])``.  This is exactly the arithmetic
+    coding step that consumes the probability mass assigned to the observed
+    token.
+
+    Args:
+      counts: Non-negative integer weights, one per candidate token.
+      index: Which slice to return.
+
+    Returns:
+      The selected sub-interval, reduced to lowest terms.
+
+    Raises:
+      ValueError: If ``counts`` is empty, contains a negative weight, sums to
+        zero, or if ``index`` is out of range.
+    """
+    if not counts:
+      raise ValueError("counts must be non-empty")
+    if any(c < 0 for c in counts):
+      raise ValueError("counts must be non-negative")
+    total = sum(counts)
+    if total <= 0:
+      raise ValueError("total weight must be positive")
+    if not (0 <= index < len(counts)):
+      raise ValueError(f"index {index} out of range for {len(counts)} slices")
+
+    prefix = sum(counts[:index])
+    span = self.num_hi - self.num_lo
+    lo = self.num_lo * total + prefix * span
+    hi = self.num_lo * total + (prefix + counts[index]) * span
+    return Interval._reduce(lo, hi, self.den * total)
+
+  def find_slice(self, counts, value):
+    """Return the index of the slice of ``self`` that contains ``value``.
+
+    This is the inverse of :meth:`subdivide`: it is what the decoder uses to
+    recover the token from a code.  Slices are treated as half-open on the left
+    and closed on the right so that the mapping matches the encoder's
+    cumulative-weight lookup, and the final slice is closed on both ends so that
+    ``value == upper`` always resolves.
+
+    Args:
+      counts: Non-negative integer weights, one per candidate token.
+      value: A rational number inside ``self``.
+
+    Returns:
+      The index of the slice containing ``value``.
+
+    Raises:
+      ValueError: If ``value`` lies outside ``self`` or ``self`` has zero width.
+    """
+    if not self.contains(value):
+      raise ValueError("value lies outside the interval")
+    total = sum(counts)
+    span = self.num_hi - self.num_lo
+    if span == 0:
+      raise ValueError("cannot subdivide a zero-width interval")
+
+    # Position of ``value`` within ``self`` measured in units of ``1 / total``.
+    pos = (value - self.lower) * total / self.width
+    cumulative = 0
+    for i, c in enumerate(counts):
+      nxt = cumulative + c
+      if pos < nxt or i == len(counts) - 1:
+        return i
+      cumulative = nxt
+    return len(counts) - 1  # pragma: no cover - defensive
+
+  def __repr__(self):  # pragma: no cover - cosmetic
+    lo, hi = float(self.lower), float(self.upper)
+    return f"Interval([{lo:.6f}, {hi:.6f}] = {self.num_lo}/{self.num_hi}/{self.den})"

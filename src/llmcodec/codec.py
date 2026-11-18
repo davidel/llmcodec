@@ -1,176 +1,268 @@
 """The arithmetic codec: encode a sentence to a real in ``[0, 1]`` and back.
 
+The codec treats a language model as a source model for arithmetic coding.  The
+model supplies a next-token probability distribution at every step; the coder
+turns a sentence into the single real number that uniquely identifies the
+sequence of choices the sentence makes.
+
 Encoding
 --------
-Starting from the full interval ``[0, 1]`` and the prefix ``<bos>``:
+Start with the interval ``[0, 1]`` and the prefix ``<bos>``.  For each token to
+be encoded (the input characters in order, then a final ``<eos>``):
 
 1. Ask the model for the next-token distribution given the current prefix.
 2. Ask the :class:`~llmcodec.candidates.CandidateSelector` for an ordered
-   candidate alphabet (token ids + integer weights) derived *only* from that
+   candidate alphabet (token ids plus integer weights) derived *only* from that
    distribution.
 3. Subdivide the current interval into one slice per candidate, in token-id
    (alphabetical) order, with widths proportional to the weights.
-4. Let the true next token choose a slice; that slice becomes the new current
-   interval.
-5. Append the true token to the prefix and repeat, consuming the input
-   characters, then finally consuming ``<eos>``.
+4. Let the true next token choose a slice; that slice becomes the new interval.
+5. Append the true token to the prefix and repeat.
 
-The emitted code is the midpoint of the final interval.  Decoding reverses the
-process: it replays the exact same candidate sets from the same prefixes, finds
-the slice containing the (rescaled) code, emits the corresponding token, and
-repeats until ``<eos>``.
+The emitted code is the midpoint of the final interval.  Every value strictly
+inside the interval decodes to the same sentence, so the midpoint is a robust
+representative.
 
-Because the candidate sets depend only on the model distribution, the decoder
-never needs to be told which tokens the encoder chose.
+Decoding
+--------
+Given a real ``r`` in ``[0, 1]``, replay the exact same candidate sets from the
+same prefixes.  At each step, find the slice of the current interval that
+contains ``r``, emit the corresponding token, narrow the interval to that slice,
+and continue.  Decoding stops at ``<eos>``.  The code is never rescaled: it
+stays in absolute ``[0, 1]`` coordinates while the interval shrinks around it,
+which is precisely the inverse of the encoding step.
+
+Because the candidate set is a deterministic function of the model
+distribution, the decoder never needs to be told which tokens the encoder chose.
 """
 
-from __future__ import annotations
-
-from collections.abc import Sequence
-from dataclasses import dataclass
+from collections import namedtuple
 from fractions import Fraction
 
-import numpy as np
 import torch
 
-from .candidates import CandidateSelector, build_selector
+from .candidates import build_selector
+from .device import resolve_device
 from .interval import Interval
-from .model import TinyLM
-from .vocab import Vocab
 
 
 class NotEncodableError(ValueError):
-    """Raised when a token has no slice in the current candidate set.
+  """Raised when a token has no slice in the current candidate set.
 
-    This can only happen with lossy selectors (``topn``/``adaptive``) when the
-    true next token falls outside the selected candidates.  The ``full``
-    selector never raises.
-    """
+  This can only happen with lossy selectors (``topn``/``adaptive``) when the
+  true next token falls outside the selected candidates.  The ``full`` selector
+  never raises because it keeps every token the model can emit.
 
-    def __init__(self, token_id: int, position: int, candidate_ids: Sequence[int]):
-        self.token_id = token_id
-        self.position = position
-        self.candidate_ids = tuple(candidate_ids)
-        super().__init__(
-            f"token {token_id} at position {position} has no slice among "
-            f"candidates {tuple(candidate_ids)}"
-        )
+  Attributes:
+    token_id: The token that could not be placed.
+    position: Its position in the input (character index, or the ``<eos>`` step).
+    candidate_ids: The candidate token ids that were available instead.
+  """
+
+  def __init__(self, token_id, position, candidate_ids):
+    """Record the offending token and the available candidates."""
+    self.token_id = token_id
+    self.position = position
+    self.candidate_ids = tuple(candidate_ids)
+    super().__init__(f"token {token_id} at position {position} has no slice among "
+                     f"candidates {tuple(candidate_ids)}")
 
 
-@dataclass
-class Encoded:
-    """The result of encoding a sentence."""
+class Encoded(namedtuple("Encoded", "value text interval n_steps")):
+  """The result of encoding a sentence.
 
-    value: Fraction
-    text: str
-    interval: Interval
-    n_steps: int
+  Attributes:
+    value: The code, as an exact :class:`~fractions.Fraction` in ``[0, 1]``.
+    text: The original (un-normalized) input text.
+    interval: The final interval; any point inside it decodes to ``text``.
+    n_steps: The number of coding steps, including the final ``<eos>`` step.
+  """
 
-    @property
-    def as_float(self) -> float:
-        return float(self.value)
+  __slots__ = ()
+
+  @property
+  def as_float(self):
+    """The code as a Python ``float`` (lossy -- prefer :attr:`value`)."""
+    return float(self.value)
 
 
 class Codec:
-    """Ties a model, a vocabulary and a candidate selector into a codec."""
+  """Ties a model, a vocabulary and a candidate selector into a codec.
 
-    def __init__(
-        self,
-        model: TinyLM,
-        vocab: Vocab,
-        selector: CandidateSelector | None = None,
-        *,
-        emittable_ids: Sequence[int] | None = None,
-        max_decode_len: int = 512,
-        device: str = "cpu",
-    ):
-        self.model = model
-        self.vocab = vocab
-        self.selector = selector if selector is not None else build_selector("full")
-        self.device = device
-        self.max_decode_len = max_decode_len
-        self.model.eval()
+  Attributes:
+    model: The language model supplying next-token distributions.
+    vocab: The vocabulary used to map text to token ids.
+    selector: The strategy that turns a distribution into a candidate set.
+    device: The torch device used for model inference.
+    max_decode_len: Safety cap on the number of decoding steps.
+    emittable_ids: The token ids the codec is allowed to place.
+  """
 
-        if emittable_ids is None:
-            # Everything the message alphabet can contain: the character
-            # tokens plus <eos> and <unk>.  <pad>/<bos> are prompt-only.
-            chars = {vocab.token_id(c) for c in vocab.itos if len(c) == 1}
-            emittable_ids = sorted(chars | {vocab.eos_id, vocab.unk_id})
-        self.emittable_ids = tuple(emittable_ids)
-        self._emittable_set = set(self.emittable_ids)
+  def __init__(self,
+               model,
+               vocab,
+               selector=None,
+               *,
+               emittable_ids=None,
+               max_decode_len=512,
+               device="auto",
+               amp_dtype=None):
+    """Initialize the codec.
 
-    # -- helpers -------------------------------------------------------------
-    def _probs(self, prefix_ids: Sequence[int]) -> np.ndarray:
-        ids = torch.tensor(list(prefix_ids), dtype=torch.long, device=self.device)
-        return self.model.next_token_probs(ids).cpu().numpy()
+    Args:
+      model: The language model.  It is moved to the resolved device and put
+        into evaluation mode.
+      vocab: The vocabulary.
+      selector: The candidate-selection strategy.  Defaults to the lossless
+        ``full`` selector.
+      emittable_ids: The token ids the codec may place.  Defaults to the
+        message characters plus ``<eos>`` and ``<unk>``; ``<pad>`` and ``<bos>``
+        are prompt-only and therefore excluded.
+      max_decode_len: Maximum number of tokens to decode before giving up.
+      device: The torch device for inference.  ``"auto"`` (the default) uses
+        CUDA when available and the CPU otherwise.
+      amp_dtype: Optional autocast dtype for CUDA inference.  Defaults to
+        ``float16`` on CUDA and ``bfloat16`` elsewhere.
+    """
+    self.model = model
+    self.vocab = vocab
+    self.selector = selector if selector is not None else build_selector("full")
+    self.device = resolve_device(device)
+    self.amp_dtype = amp_dtype
+    self.max_decode_len = max_decode_len
+    self.model.to(self.device)
+    self.model.eval()
 
-    def _candidates(self, probs: np.ndarray):
-        return self.selector.select(probs, self.emittable_ids)
+    if emittable_ids is None:
+      # Everything the message alphabet can contain: the character tokens plus
+      # <eos> and <unk>.  <pad>/<bos> are prompt-only and never emitted.
+      chars = {vocab.token_id(c) for c in vocab.itos if len(c) == 1}
+      emittable_ids = sorted(chars | {vocab.eos_id, vocab.unk_id})
+    self.emittable_ids = tuple(emittable_ids)
 
-    # -- encoding ------------------------------------------------------------
-    def encode(self, text: str) -> Encoded:
-        """Encode ``text`` into a real number in ``[0, 1]``."""
-        char_ids = self.vocab.encode(text)  # lower-cased, unknowns -> <unk>
-        prefix = [self.vocab.bos_id]
-        interval = Interval.unit()
+  def _probs(self, prefix_ids):
+    """Return the next-token distribution for ``prefix_ids`` as a numpy array.
 
-        for position, token_id in enumerate(char_ids):
-            cand = self._candidates(self._probs(prefix))
-            idx = cand.index_of(token_id)
-            if idx is None:
-                raise NotEncodableError(token_id, position, cand.token_ids)
-            interval = interval.subdivide(cand.weights, idx)
-            prefix.append(token_id)
+    Args:
+      prefix_ids: The token ids seen so far.
 
-        # Consume the end-of-sentence marker.
-        cand = self._candidates(self._probs(prefix))
-        idx = cand.index_of(self.vocab.eos_id)
-        if idx is None:
-            raise NotEncodableError(self.vocab.eos_id, len(char_ids), cand.token_ids)
-        interval = interval.subdivide(cand.weights, idx)
+    Returns:
+      A ``(vocab_size,)`` probability vector.
+    """
+    ids = torch.tensor(list(prefix_ids), dtype=torch.long, device=self.device)
+    probs = self.model.next_token_probs(ids, amp_dtype=self.amp_dtype)
+    return probs.cpu().numpy()
 
-        return Encoded(
-            value=interval.midpoint(),
-            text=text,
-            interval=interval,
-            n_steps=len(char_ids) + 1,
-        )
+  def _candidates(self, probs):
+    """Return the candidate set for a distribution.
 
-    def encode_float(self, text: str) -> float:
-        return float(self.encode(text).value)
+    Args:
+      probs: The next-token probability vector.
 
-    # -- decoding ------------------------------------------------------------
-    def decode(self, value: Fraction | float | int) -> str:
-        """Decode a real number in ``[0, 1]`` back into a sentence."""
-        code = value if isinstance(value, Fraction) else Fraction(value)
-        if not (0 <= code <= 1):
-            raise ValueError("code must lie in [0, 1]")
+    Returns:
+      The :class:`~llmcodec.candidates.CandidateSet` chosen by the selector.
+    """
+    return self.selector.select(probs, self.emittable_ids)
 
-        prefix = [self.vocab.bos_id]
-        interval = Interval.unit()
-        out: list[int] = []
+  def encode(self, text):
+    """Encode ``text`` into a real number in ``[0, 1]``.
 
-        for _ in range(self.max_decode_len):
-            cand = self._candidates(self._probs(prefix))
-            # The code stays in absolute [0, 1] coordinates: the interval simply
-            # narrows around it, so ``find_slice`` always operates on the code's
-            # current position.  This is exactly inverse to encoding.
-            idx = interval.find_slice(cand.weights, code)
-            token_id = cand.token_ids[idx]
+    The text is lower-cased and any character outside the message alphabet
+    becomes ``<unk>``.  The characters are consumed in order, followed by a
+    final ``<eos>``.
 
-            if token_id == self.vocab.eos_id:
-                return self.vocab.decode(out, skip_special=False)
+    Args:
+      text: The sentence to encode.
 
-            interval = interval.subdivide(cand.weights, idx)
-            out.append(token_id)
-            prefix.append(token_id)
+    Returns:
+      An :class:`Encoded` holding the code, the interval, and the step count.
 
-        raise RuntimeError(f"decoding exceeded max_decode_len={self.max_decode_len} without <eos>")
+    Raises:
+      NotEncodableError: If a token has no slice under the current selector.
+    """
+    char_ids = self.vocab.encode(text)
+    prefix = [self.vocab.bos_id]
+    interval = Interval.unit()
 
-    # -- introspection -------------------------------------------------------
-    def describe(self) -> dict:
-        return {
-            "selector": self.selector.describe(),
-            "emittable_ids": list(self.emittable_ids),
-            "vocab_size": self.vocab.vocab_size,
-        }
+    for position, token_id in enumerate(char_ids):
+      cand = self._candidates(self._probs(prefix))
+      idx = cand.index_of(token_id)
+      if idx is None:
+        raise NotEncodableError(token_id, position, cand.token_ids)
+      interval = interval.subdivide(cand.weights, idx)
+      prefix.append(token_id)
+
+    # Consume the end-of-sentence marker to terminate the sequence.
+    cand = self._candidates(self._probs(prefix))
+    idx = cand.index_of(self.vocab.eos_id)
+    if idx is None:
+      raise NotEncodableError(self.vocab.eos_id, len(char_ids), cand.token_ids)
+    interval = interval.subdivide(cand.weights, idx)
+
+    return Encoded(
+        value=interval.midpoint(),
+        text=text,
+        interval=interval,
+        n_steps=len(char_ids) + 1,
+    )
+
+  def encode_float(self, text):
+    """Encode ``text`` and return the code as a ``float``.
+
+    Args:
+      text: The sentence to encode.
+
+    Returns:
+      The code as a Python ``float`` in ``[0, 1]``.
+    """
+    return float(self.encode(text).value)
+
+  def decode(self, value):
+    """Decode a real number in ``[0, 1]`` back into a sentence.
+
+    Args:
+      value: The code, as a :class:`~fractions.Fraction`, ``float`` or ``int``.
+
+    Returns:
+      The decoded sentence.
+
+    Raises:
+      ValueError: If ``value`` lies outside ``[0, 1]``.
+      RuntimeError: If decoding exceeds ``max_decode_len`` without seeing
+        ``<eos>`` (which indicates a code that does not correspond to any
+        encoded sentence).
+    """
+    code = value if isinstance(value, Fraction) else Fraction(value)
+    if not (0 <= code <= 1):
+      raise ValueError("code must lie in [0, 1]")
+
+    prefix = [self.vocab.bos_id]
+    interval = Interval.unit()
+    out = []
+
+    for _ in range(self.max_decode_len):
+      cand = self._candidates(self._probs(prefix))
+      # The code stays in absolute [0, 1] coordinates: the interval simply
+      # narrows around it, so find_slice always operates on the code's current
+      # position.  This is exactly inverse to encoding.
+      idx = interval.find_slice(cand.weights, code)
+      token_id = cand.token_ids[idx]
+
+      if token_id == self.vocab.eos_id:
+        return self.vocab.decode(out, skip_special=False)
+
+      interval = interval.subdivide(cand.weights, idx)
+      out.append(token_id)
+      prefix.append(token_id)
+
+    raise RuntimeError(
+        f"decoding exceeded max_decode_len={self.max_decode_len} without <eos>")
+
+  def describe(self):
+    """Return a JSON-friendly description of the codec configuration."""
+    return {
+        "selector": self.selector.describe(),
+        "emittable_ids": list(self.emittable_ids),
+        "vocab_size": self.vocab.vocab_size,
+        "device": str(self.device),
+    }
