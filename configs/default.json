@@ -1,0 +1,25 @@
+{
+  "source": "tinystories",
+  "split": "train",
+  "max_stories": 200000,
+  "block_size": 256,
+  "batch_size": 64,
+  "steps": 50000,
+  "lr": 0.0003,
+  "min_lr": 0.00003,
+  "warmup_steps": 500,
+  "weight_decay": 0.1,
+  "grad_clip": 1.0,
+  "seed": 1337,
+  "device": "cpu",
+  "out_dir": "runs/default",
+  "model": {
+    "vocab_size": 43,
+    "d_model": 512,
+    "n_layers": 6,
+    "n_heads": 8,
+    "d_ff": 2048,
+    "max_seq_len": 256,
+    "dropout": 0.0
+  }
+}
