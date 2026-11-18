@@ -42,6 +42,20 @@ probability interval, and the final interval *is* the code.
 - [Limitations and FAQ](#limitations-and-faq)
 - [License](#license)
 
+## How to read this codebase
+
+The package is a pipeline of small, independent modules, each of which can be
+read on its own:
+
+1. `interval.py` — exact rational interval arithmetic.  This is the arithmetic
+   coder's engine and stands alone; its docstrings are executable examples.
+2. `candidates.py` — turns a probability vector into an integer-weighted
+   candidate set (determinism is the load-bearing property).
+3. `codec.py` — wires a model + vocabulary + selector into encode/decode.
+4. `model.py` — the tiny transformer that supplies next-token distributions.
+
+Read them in that order: each one only depends on the ones above it.
+
 ---
 
 ## Background: arithmetic coding with a language model
@@ -349,7 +363,16 @@ See the [architecture table](#model-architecture).
 ```bash
 pytest -m "not slow"   # fast unit + property tests (no training/network)
 pytest -m slow         # includes a short end-to-end training run
+pytest --doctest-modules src/llmcodec/interval.py \
+        src/llmcodec/candidates.py src/llmcodec/vocab.py   # executable docs
+pytest -m "not slow" --cov=llmcodec --cov-report=term-missing   # coverage
 ```
+
+The examples in the docstrings are executable: the `doctest` command above
+checks them, so the documentation cannot drift away from the code. Coverage is
+gated in CI at a floor (see `[tool.coverage.report]` in `pyproject.toml`); the
+CLI parsers and the training loop body are only reached by the `slow` tests and
+are excluded from that expectation.
 
 The codec tests assert **exact** round-trips with an *untrained* model, which is
 the strongest possible correctness check for the coder: losslessness must not

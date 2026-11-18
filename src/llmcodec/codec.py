@@ -57,15 +57,33 @@ class NotEncodableError(ValueError):
     token_id: The token that could not be placed.
     position: Its position in the input (character index, or the ``<eos>`` step).
     candidate_ids: The candidate token ids that were available instead.
+    token: The human-readable text of the offending token, when available.
+    candidates: The human-readable text of the candidate tokens, when available.
   """
 
-  def __init__(self, token_id, position, candidate_ids):
-    """Record the offending token and the available candidates."""
+  def __init__(self, token_id, position, candidate_ids, token=None, candidates=None):
+    """Record the offending token and the available candidates.
+
+    Args:
+      token_id: The id of the token that could not be placed.
+      position: Its position in the input.
+      candidate_ids: The candidate token ids that were available instead.
+      token: Optional human-readable text of the offending token.  The codec
+        passes this so the message reads ``'q'`` rather than a bare id.
+      candidates: Optional human-readable text of the candidate tokens.
+    """
     self.token_id = token_id
     self.position = position
     self.candidate_ids = tuple(candidate_ids)
-    super().__init__(f"token {token_id} at position {position} has no slice among "
-                     f"candidates {tuple(candidate_ids)}")
+    self.token = token
+    self.candidates = tuple(candidates) if candidates is not None else None
+    token_repr = f"{token!r} (id {token_id})" if token is not None else token_id
+    if self.candidates is not None:
+      candidate_repr = list(self.candidates)
+    else:
+      candidate_repr = list(self.candidate_ids)
+    super().__init__(f"token {token_repr} at position {position} has no slice "
+                     f"among candidates {candidate_repr}")
 
 
 class Encoded(namedtuple("Encoded", "value text interval n_steps")):
@@ -164,6 +182,26 @@ class Codec:
     """
     return self.selector.select(probs, self.emittable_ids)
 
+  def _not_encodable(self, token_id, position, candidate_ids):
+    """Build a :class:`NotEncodableError` with human-readable token text.
+
+    Args:
+      token_id: The id of the token that could not be placed.
+      position: Its position in the input.
+      candidate_ids: The candidate token ids that were available instead.
+
+    Returns:
+      A :class:`NotEncodableError` whose message names the tokens rather than
+      only their ids.
+    """
+    return NotEncodableError(
+        token_id,
+        position,
+        candidate_ids,
+        token=self.vocab.itos[token_id],
+        candidates=[self.vocab.itos[i] for i in candidate_ids],
+    )
+
   def encode(self, text):
     """Encode ``text`` into a real number in ``[0, 1]``.
 
@@ -188,7 +226,7 @@ class Codec:
       cand = self._candidates(self._probs(prefix))
       idx = cand.index_of(token_id)
       if idx is None:
-        raise NotEncodableError(token_id, position, cand.token_ids)
+        raise self._not_encodable(token_id, position, cand.token_ids)
       interval = interval.subdivide(cand.weights, idx)
       prefix.append(token_id)
 
@@ -196,7 +234,7 @@ class Codec:
     cand = self._candidates(self._probs(prefix))
     idx = cand.index_of(self.vocab.eos_id)
     if idx is None:
-      raise NotEncodableError(self.vocab.eos_id, len(char_ids), cand.token_ids)
+      raise self._not_encodable(self.vocab.eos_id, len(char_ids), cand.token_ids)
     interval = interval.subdivide(cand.weights, idx)
 
     return Encoded(

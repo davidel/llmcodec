@@ -71,6 +71,15 @@ class Vocab(namedtuple("Vocab", "itos")):
 
     Raises:
       ValueError: If any token string occurs more than once.
+
+    Example:
+      >>> vocab = Vocab.build()
+      >>> vocab.vocab_size
+      43
+      >>> vocab.token_id("a")
+      4
+      >>> vocab.bos_id
+      1
     """
     itos = tuple(specials) + tuple(chars)
     if len(set(itos)) != len(itos):
@@ -157,6 +166,12 @@ class Vocab(namedtuple("Vocab", "itos")):
 
     Returns:
       The list of token ids.
+
+    Example:
+      >>> Vocab.build().encode("cat")
+      [6, 4, 23]
+      >>> Vocab.build().encode("cat", add_bos=True, add_eos=True)
+      [1, 6, 4, 23, 2]
     """
     stoi = self.stoi
     unk = self.unk_id

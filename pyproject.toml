@@ -1,20 +1,20 @@
 [build-system]
-requires = ["setuptools>=68", "wheel"]
+requires = ["setuptools>=77", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "llmcodec"
-version = "0.1.0"
+dynamic = ["version"]
 description = "Encode sentences as real numbers in [0, 1] using a tiny language model as an arithmetic coder."
 readme = "README.md"
 requires-python = ">=3.10"
-license = { text = "MIT" }
+license = "MIT"
+license-files = ["LICENSE"]
 authors = [{ name = "llmcodec contributors" }]
 keywords = ["llm", "arithmetic-coding", "compression", "tinystories", "transformer"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Science/Research",
-    "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
@@ -50,15 +50,31 @@ Repository = "https://github.com/davidel/llmcodec"
 [tool.setuptools]
 package-dir = { "" = "src" }
 
+[tool.setuptools.dynamic]
+version = { attr = "llmcodec.__version__" }
+
 [tool.setuptools.packages.find]
 where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+pythonpath = ["src"]
 addopts = "-q"
 markers = [
     "slow: tests that train a model or require the network",
 ]
+
+[tool.coverage.run]
+branch = true
+source = ["llmcodec"]
+
+[tool.coverage.report]
+# The CLI parsers and the training loop body are only exercised by the
+# network-free ``slow`` tests, so the fast suite targets a realistic floor
+# rather than full coverage.
+fail_under = 65
+show_missing = true
+skip_covered = true
 
 # Formatting is handled by yapf, configured in .style.yapf (Google style,
 # 2-space indent, 88-column limit).  Ruff is used for linting only.

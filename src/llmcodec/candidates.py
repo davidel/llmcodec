@@ -42,6 +42,16 @@ import numpy as np
 # denominators (and therefore the cost of the exact-rational arithmetic).
 WEIGHT_SCALE = 1 << 20
 
+__all__ = [
+    "AdaptiveSelector",
+    "CandidateSelector",
+    "CandidateSet",
+    "FullVocabSelector",
+    "TopNSelector",
+    "WEIGHT_SCALE",
+    "build_selector",
+]
+
 
 class CandidateSet(namedtuple("CandidateSet", "token_ids weights")):
   """An ordered candidate alphabet with positive integer weights.
@@ -54,6 +64,15 @@ class CandidateSet(namedtuple("CandidateSet", "token_ids weights")):
     token_ids: The candidate token ids, in the order they are laid out.
     weights: The positive integer weight of each candidate, aligned with
       ``token_ids``.
+
+  Example:
+    >>> candidates = CandidateSet([4, 5], [3, 1])
+    >>> candidates.token_ids
+    (4, 5)
+    >>> candidates.index_of(5)
+    1
+    >>> candidates.index_of(99) is None
+    True
   """
 
   __slots__ = ()
@@ -92,11 +111,20 @@ def _quantize(probs):
   candidate always gets a non-zero slice (which keeps the interval arithmetic
   well defined even for extremely small probabilities).
 
+  The integer grid is :data:`WEIGHT_SCALE`, which fixes the *fidelity* of the
+  quantisation against its *cost*: a finer grid tracks the model distribution
+  more faithfully, but multiplies the interval denominators by a larger total
+  weight at every coding step (see :mod:`llmcodec.interval`).
+
   Args:
     probs: A 1-D array of probabilities in ``[0, 1]``.
 
   Returns:
     An integer array of the same shape, with every entry at least ``1``.
+
+  Example:
+    >>> _quantize(np.array([0.5, 0.25, 0.0]))
+    array([524288, 262144,      1])
   """
   weights = np.rint(probs * WEIGHT_SCALE).astype(np.int64)
   weights[weights < 1] = 1

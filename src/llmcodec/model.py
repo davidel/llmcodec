@@ -198,7 +198,7 @@ class TinyLM(nn.Module):
       The loaded model, moved to the resolved device and set to evaluation mode.
     """
     device = resolve_device(map_location or "auto")
-    ckpt = torch.load(path, map_location="cpu")
+    ckpt = torch.load(path, map_location="cpu", weights_only=True)
     model = cls(ModelConfig.from_dict(ckpt["config"]))
     model.load_state_dict(ckpt["state_dict"])
     model.to(device)

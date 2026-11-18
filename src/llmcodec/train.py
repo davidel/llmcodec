@@ -13,6 +13,7 @@ download.
 """
 
 import json
+import logging
 import math
 import os
 import time
@@ -35,6 +36,8 @@ from .device import (
 )
 from .model import ModelConfig, TinyLM
 from .vocab import DEFAULT_VOCAB
+
+logger = logging.getLogger(__name__)
 
 
 class TrainConfig:
@@ -237,12 +240,12 @@ def train(cfg=None, vocab=None):
 
   model = TinyLM(cfg.model).to(device)
   n_params = sum(p.numel() for p in model.parameters())
-  print(f"[llmcodec] vocab={vocab.vocab_size} params={n_params:,} "
-        f"tokens={tokens.numel():,}")
-  print(
-      f"[llmcodec] train_blocks={len(train_dataset):,} val_blocks={len(val_dataset):,}")
+  logger.info("vocab=%d params=%s tokens=%s", vocab.vocab_size, f"{n_params:,}",
+              f"{tokens.numel():,}")
+  logger.info("train_blocks=%s val_blocks=%s", f"{len(train_dataset):,}",
+              f"{len(val_dataset):,}")
   amp_note = f"amp={amp_dtype}" if cfg.amp else "amp=off"
-  print(f"[llmcodec] device={device} {amp_note}")
+  logger.info("device=%s %s", device, amp_note)
 
   optimizer = torch.optim.AdamW(
       model.parameters(),
@@ -284,8 +287,8 @@ def train(cfg=None, vocab=None):
         window = running[-cfg.log_every:]
         avg = sum(window) / len(window)
         dt = time.time() - t0
-        print(f"[llmcodec] step {step:>6}/{cfg.steps} loss {avg:.4f} "
-              f"lr {lr:.2e} elapsed {dt:6.1f}s")
+        logger.info("step %6d/%d loss %.4f lr %.2e elapsed %6.1fs", step, cfg.steps,
+                    avg, lr, dt)
       if cfg.eval_every and step > 0 and step % cfg.eval_every == 0:
         val = evaluate(model,
                        val_dataset,
@@ -293,7 +296,7 @@ def train(cfg=None, vocab=None):
                        generator,
                        device=device,
                        amp_dtype=amp_dtype)
-        print(f"[llmcodec] step {step:>6} val_loss {val:.4f}")
+        logger.info("step %6d val_loss %.4f", step, val)
       step += 1
 
   model.save(ckpt_path)
@@ -306,7 +309,7 @@ def train(cfg=None, vocab=None):
                        generator,
                        device=device,
                        amp_dtype=amp_dtype)
-  print(f"[llmcodec] done. final val_loss {final_val:.4f}. checkpoint -> {ckpt_path}")
+  logger.info("done. final val_loss %.4f. checkpoint -> %s", final_val, ckpt_path)
   return ckpt_path
 
 
@@ -320,6 +323,8 @@ def main(argv=None):
     The process exit code.
   """
   import argparse
+
+  logging.basicConfig(level=logging.INFO, format="[llmcodec] %(message)s")
 
   parser = argparse.ArgumentParser(description="Train the llmcodec TinyLM.")
   parser.add_argument(

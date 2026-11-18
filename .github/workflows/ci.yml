@@ -25,5 +25,11 @@ jobs:
         run: ruff check src tests examples
       - name: Format check (yapf)
         run: yapf --diff --recursive --style .style.yapf src tests examples
+      - name: Doctests
+        run: >-
+          pytest --doctest-modules
+          src/llmcodec/interval.py
+          src/llmcodec/candidates.py
+          src/llmcodec/vocab.py
       - name: Tests
-        run: pytest -m "not slow"
+        run: pytest -m "not slow" --cov=llmcodec --cov-report=term-missing

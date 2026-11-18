@@ -61,6 +61,10 @@ class Interval(namedtuple("Interval", "num_lo num_hi den")):
     """Return the full interval ``[0, 1]``.
 
     This is the starting interval for both encoding and decoding.
+
+    Example:
+      >>> Interval.unit()
+      Interval([0.000000, 1.000000] = 0/1/1)
     """
     return cls(0, 1, 1)
 
@@ -124,6 +128,10 @@ class Interval(namedtuple("Interval", "num_lo num_hi den")):
     The width is a natural measure of how "uncertain" the code still is: a
     wider interval means fewer bits of information have been committed, which is
     what a well-trained language model achieves for likely sentences.
+
+    Example:
+      >>> Interval(0, 3, 4).width
+      Fraction(3, 4)
     """
     return Fraction(self.num_hi - self.num_lo, self.den)
 
@@ -133,11 +141,22 @@ class Interval(namedtuple("Interval", "num_lo num_hi den")):
     The encoder emits this value as the final code.  Any point strictly inside
     the interval decodes to the same sentence, so the midpoint is a robust
     choice that stays as far as possible from the boundaries.
+
+    Example:
+      >>> Interval(0, 3, 4).midpoint()
+      Fraction(3, 8)
     """
     return Fraction(self.num_lo + self.num_hi, 2 * self.den)
 
   def contains(self, value):
-    """Return whether ``value`` lies within the closed interval."""
+    """Return whether ``value`` lies within the closed interval.
+
+    Example:
+      >>> Interval(0, 3, 4).contains(Fraction(1, 2))
+      True
+      >>> Interval(0, 3, 4).contains(Fraction(7, 8))
+      False
+    """
     return self.lower <= value <= self.upper
 
   def subdivide(self, counts, index):
@@ -159,6 +178,15 @@ class Interval(namedtuple("Interval", "num_lo num_hi den")):
     Raises:
       ValueError: If ``counts`` is empty, contains a negative weight, sums to
         zero, or if ``index`` is out of range.
+
+    Example:
+      Subdividing ``[0, 1]`` into a 3:1 split puts the first branch in the
+      lower three quarters:
+
+      >>> Interval.unit().subdivide([3, 1], 0)
+      Interval([0.000000, 0.750000] = 0/3/4)
+      >>> Interval.unit().subdivide([3, 1], 1)
+      Interval([0.750000, 1.000000] = 3/4/4)
     """
     if not counts:
       raise ValueError("counts must be non-empty")
@@ -194,6 +222,14 @@ class Interval(namedtuple("Interval", "num_lo num_hi den")):
 
     Raises:
       ValueError: If ``value`` lies outside ``self`` or ``self`` has zero width.
+
+    Example:
+      A 3:1 split of ``[0, 1]`` sends ``7/8`` to the upper branch:
+
+      >>> Interval.unit().find_slice([3, 1], Fraction(7, 8))
+      1
+      >>> Interval.unit().find_slice([3, 1], Fraction(1, 8))
+      0
     """
     if not self.contains(value):
       raise ValueError("value lies outside the interval")

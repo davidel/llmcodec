@@ -16,6 +16,7 @@ Exposes four subcommands:
 """
 
 import argparse
+import logging
 from fractions import Fraction
 
 from .candidates import build_selector
@@ -257,6 +258,7 @@ def main(argv=None):
   Returns:
     The process exit code.
   """
+  logging.basicConfig(level=logging.INFO, format="[llmcodec] %(message)s")
   parser = build_parser()
   args = parser.parse_args(argv)
   return args.func(args)

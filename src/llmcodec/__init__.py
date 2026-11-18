@@ -20,6 +20,7 @@ Public API:
 """
 
 from .candidates import (
+    WEIGHT_SCALE,
     AdaptiveSelector,
     CandidateSelector,
     CandidateSet,
@@ -52,6 +53,7 @@ __all__ = [
     "TinyLM",
     "TopNSelector",
     "Vocab",
+    "WEIGHT_SCALE",
     "autocast_context",
     "build_selector",
     "make_grad_scaler",

@@ -1,8 +1,5 @@
-"""Test configuration: make the ``src`` layout importable without installing."""
+"""Shared pytest configuration for the test suite.
 
-import os
-import sys
-
-SRC = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src")
-if SRC not in sys.path:
-  sys.path.insert(0, SRC)
+The ``src`` layout is put on ``sys.path`` by the ``pythonpath`` option in
+``pyproject.toml``, so no manual path juggling is needed here.
+"""
