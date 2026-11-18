@@ -44,8 +44,8 @@ all = ["llmcodec[data,dev]"]
 llmcodec = "llmcodec.cli:main"
 
 [project.urls]
-Homepage = "https://github.com/example/llmcodec"
-Repository = "https://github.com/example/llmcodec"
+Homepage = "https://github.com/davidel/llmcodec"
+Repository = "https://github.com/davidel/llmcodec"
 
 [tool.setuptools]
 package-dir = { "" = "src" }
