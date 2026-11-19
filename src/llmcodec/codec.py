@@ -43,7 +43,7 @@ import torch
 
 from .candidates import build_selector
 from .device import resolve_device
-from .interval import Interval
+from .interval import BitCode, Interval
 
 
 class NotEncodableError(ValueError):
@@ -254,6 +254,53 @@ class Codec:
       The code as a Python ``float`` in ``[0, 1]``.
     """
     return float(self.encode(text).value)
+
+  def encode_bits(self, text):
+    """Encode ``text`` as a :class:`~llmcodec.interval.BitCode`.
+
+    This is the binary form of :meth:`encode`.  The final interval is quantized
+    onto the coarsest dyadic cell fully contained in it, and the cell is
+    returned as ``(n, k)``: ``n`` bits whose value is ``k / 2**n``.  Any point of
+    the cell -- in particular the code's own value -- lies inside the interval,
+    so the bits decode back to the same sentence.
+
+    The code is the shortest containment-safe form of the interval: its length
+    is within two bits of the information-theoretic optimum ``ceil(-log2 w)``.
+
+    Args:
+      text: The sentence to encode.
+
+    Returns:
+      The :class:`~llmcodec.interval.BitCode` for ``text``.
+
+    Raises:
+      NotEncodableError: If a token has no slice under the current selector.
+    """
+    return self.encode(text).interval.dyadic()
+
+  def decode_bits(self, code):
+    """Decode a :class:`~llmcodec.interval.BitCode` back into a sentence.
+
+    This is the inverse of :meth:`encode_bits`: the code names the dyadic cell
+    ``[k / 2**n, (k + 1) / 2**n]``, and its lower edge ``k / 2**n`` is a point
+    inside the interval the encoder produced, so :meth:`decode` recovers the
+    sentence.
+
+    Args:
+      code: The :class:`~llmcodec.interval.BitCode` to decode.
+
+    Returns:
+      The decoded sentence.
+
+    Raises:
+      ValueError: If ``code`` is not a :class:`~llmcodec.interval.BitCode`.
+      RuntimeError: If decoding exceeds ``max_decode_len`` without seeing
+        ``<eos>`` (which indicates a code that does not correspond to any
+        encoded sentence).
+    """
+    if not isinstance(code, BitCode):
+      raise ValueError("decode_bits expects a BitCode")
+    return self.decode(code.value)
 
   def decode(self, value):
     """Decode a real number in ``[0, 1]`` back into a sentence.

@@ -27,6 +27,7 @@ probability interval, and the final interval *is* the code.
 - [A worked example](#a-worked-example)
 - [Algorithm](#algorithm)
 - [Why exact rational arithmetic](#why-exact-rational-arithmetic)
+- [Binary encoding (dyadic bit codes)](#binary-encoding-dyadic-bit-codes)
 - [Candidate selection is pluggable](#candidate-selection-is-pluggable)
 - [Vocabulary](#vocabulary)
 - [Model architecture](#model-architecture)
@@ -178,6 +179,174 @@ the candidate weights each step, which is why the weights are quantized to a
 fixed scale (`WEIGHT_SCALE = 2**20`) rather than using the raw float
 probabilities.
 
+## Binary encoding (dyadic bit codes)
+
+The real number in `[0, 1]` is an idealised object: it carries an
+infinite-precision numerator and denominator and cannot be serialised as-is. The
+**binary encoding** turns the final interval into an actual bit string — the
+concrete, storable form of the same information.
+
+### The rule: the cell must fit *inside* the interval
+
+Cut `[0, 1]` into `2**n` equal **dyadic cells** for `n = 0, 1, 2, ...`:
+
+```text
+[0/2^n, 1/2^n], [1/2^n, 2/2^n], ..., [(2^n - 1)/2^n, 2^n/2^n]
+```
+
+The code is the **coarsest cell that is entirely contained in the final
+interval** `[lo, hi]`. Writing the cell as `[k/2^n, (k+1)/2^n]`, containment is
+
+```text
+k / 2^n >= lo      and      (k + 1) / 2^n <= hi
+```
+
+so we take `k = ceil(lo * 2^n)` and the smallest `n` for which the top edge
+`(k + 1) / 2^n` is still `<= hi`. The code is then `k` written as exactly `n`
+bits (zero-padded on the left), and its value is the cell's lower edge
+`k / 2^n`.
+
+**Why the whole cell, not just the raw bit expansion of `lo`?** Because the
+cell is contained in `[lo, hi]`, *every* point of the cell — in particular
+`k / 2^n` — decodes to the same sentence. The code never depends on staying
+clear of an interval boundary, so it survives rounding and truncation. (Naively
+emitting the binary expansion of `lo`, i.e. rounding `lo` **down**, gives a cell
+that starts *below* `lo` and therefore sticks out of the interval — the wrong
+direction.)
+
+**Length.** A cell of width `2^-n` must fit in an interval of width `w = hi -
+lo`, so `2^-n <= w`, i.e. `n >= ceil(-log2(w))`. The chosen `n` is the smallest
+such value; the containment requirement costs **at most two bits** over that
+information-theoretic optimum, independent of sentence length.
+
+**Why this is arithmetic coding.** Walking the dyadic grid like this *is* binary
+arithmetic coding in its most direct form: a probable sentence leaves a wide
+interval, which is captured by a coarse (short) cell; an improbable one needs a
+deeper grid (more bits).
+
+### Worked example (hand-checkable)
+
+Two symbols with weights `6 : 4`, encoding `A` (index 0) then `B` (index 1):
+
+```text
+start:      [0, 1]
+A (index 0): subdivide([6,4], 0) -> [0, 3/5]        width 3/5
+B (index 1): subdivide([6,4], 1) -> [9/25, 3/5]     width 6/25
+```
+
+`width = 6/25 = 0.24`, so `ceil(-log2(0.24)) = 3`. Walking the grids:
+
+| `n` | `k = ceil(lo * 2^n)` | cell | contained? |
+|-----|----------------------|------|------------|
+| 1 | 1 | `[1/2, 1]` | no — the cell extends past `hi = 0.6` |
+| 2 | 2 | `[1/2, 3/4]` | no — `3/4 > 0.6` |
+| 3 | 3 | `[3/8, 1/2]` | **yes** → bits `011` |
+
+The code is `n = 3, k = 3` → bits `011`, value `3/8 = 0.375`, which indeed lies
+in `[0.36, 0.6]`. Decoding `011` walks the same tree:
+
+```text
+[0,1].find_slice([6,4], 3/8) = 0        -> 'A'
+[0,3/5].find_slice([6,4], 3/8) = 1      -> 'B'
+```
+
+Three bits for two symbols at ~2.06 bits of entropy — within the
+arithmetic-coding guarantee.
+
+### API
+
+The math lives in `interval.py`, where it is testable with no model at all:
+
+```python
+from llmcodec.interval import Interval
+
+code = Interval(9, 15, 25).dyadic()   # BitCode(n=3, k=3)
+code.bits        # '011'                the bit string
+code.n           # 3                    number of bits (grid depth)
+code.k           # 3                    cell index
+code.value       # Fraction(3, 8)       k / 2**n, inside the interval
+code.width       # Fraction(1, 8)       2**-n
+code.cell        # Interval(3, 4, 8)    the contained dyadic cell
+```
+
+`Interval.dyadic()` returns a `BitCode`; it raises `ValueError` for a zero-width
+interval (no cell can be contained). At the codec level the same thing is
+exposed as `Codec.encode_bits(text)` / `Codec.decode_bits(code)`:
+
+```python
+from llmcodec import BitCode, Codec, TinyLM, build_selector
+from llmcodec.vocab import DEFAULT_VOCAB
+
+model = TinyLM.load("runs/default/model.pt")
+codec = Codec(model, DEFAULT_VOCAB, build_selector("full"))
+
+code = codec.encode_bits("the cat sat")
+print(code.bits)          # e.g. '10101001001101111110001101000010001010'
+print(code.n)             # its length in bits
+print(code.value)         # exact Fraction, inside the interval
+print(codec.decode_bits(code))   # 'the cat sat'
+```
+
+The plain real-number API is unchanged: `encode_bits` is exactly
+`encode(text).interval.dyadic()`, and `decode_bits` decodes at the code's exact
+value `k / 2^n`. Prefer the exact `Fraction` (`code.value`); the `float` view is
+lossy at 40–65 bits.
+
+### Correctness notes
+
+1. **The cell is inside the interval.** By construction `lo <= k/2^n` and
+   `(k+1)/2^n <= hi`, so the whole cell — and the code's value — is a valid
+   point of `[lo, hi]`.
+2. **Boundaries are safe.** Because the *entire* cell is contained, the code
+   never lands exactly on an internal slice boundary of the interval, which is
+   the one place a half-open `find_slice` could pick a neighbouring slice.
+3. **Keep endpoints exact.** At 40–65 bits `2^-n` is far below float precision;
+   conversion to `float` must be for display only, never for code selection or
+   decoding.
+4. **The unit interval is degenerate but defined.** `Interval(0, 1, 1).dyadic()`
+   returns `BitCode(0, 0)` (bits `''`), and a zero-width interval raises
+   `ValueError`.
+
+### Measured behaviour on real sentences
+
+Encoded with an untrained tiny model (`d_model=16, n_layers=1`, seeded with
+`torch.manual_seed(0)`) and the lossless `full` selector, comparing the optimal
+length `ceil(-log2 w)` with the length `n` the containment rule needs:
+
+| text | interval width `w` | `ceil(-log2 w)` | `n` needed | bits |
+|------|--------------------|-----------------|------------|------|
+| `'a'` | 5.4e-04 | 11 | **12** | `000011000011` |
+| `'the cat'` | 1.2e-13 | 43 | **44** | `10000011000110010010100110100110001000101110` |
+| `'hello world'` | 4.5e-20 | 65 | **65** | `00111000101011010001111100110000010000001001100110111011000000111` |
+
+The overshoot is 0–2 bits: the cost of restricting the code to a *closed* dyadic
+cell rather than an arbitrary point in the interval. It is bounded and
+independent of sentence length, which is exactly the classic arithmetic-coding
+result.
+
+Reproduce the table with:
+
+```bash
+python - <<'PY'
+import torch
+from math import ceil, log2
+from llmcodec import Codec, TinyLM, build_selector
+from llmcodec.model import ModelConfig
+from llmcodec.vocab import DEFAULT_VOCAB
+
+torch.manual_seed(0)
+model = TinyLM(ModelConfig(vocab_size=DEFAULT_VOCAB.vocab_size,
+                           d_model=16, n_layers=1, n_heads=2, d_ff=32))
+model.eval()
+codec = Codec(model, DEFAULT_VOCAB, build_selector("full"))
+for text in ("a", "the cat", "hello world"):
+  enc = codec.encode(text)
+  code = codec.encode_bits(text)
+  print(text, float(enc.interval.width), ceil(-log2(float(enc.interval.width))),
+        code.n, code.bits)
+PY
+```
+
 ## Candidate selection is pluggable
 
 The candidate set must be a deterministic function of the model distribution so
@@ -300,6 +469,37 @@ Use `--mode topn --n 5` or `--mode adaptive --coverage 0.999` to try the lossy
 selectors. If a character is not in the candidate set, `encode` prints a hint and
 exits non-zero rather than raising.
 
+### Binary codes
+
+`encode-bits` / `decode-bits` are the bit-string counterparts of `encode` /
+`decode` (see [Binary encoding](#binary-encoding-dyadic-bit-codes)):
+
+```bash
+llmcodec encode-bits "the cat sat" --model runs/default/model.pt
+# text      : 'the cat sat'
+# bits      : 100000110001100100101001101001100010011110110101001011111001100101
+# n         : 66
+# k         : 37786509947975286373
+# value     : 0.512102611892
+# fraction  : 37786509947975286373/73786976294838206464
+# cell      : Interval([0.512103, 0.512103] = ...)
+# selector  : {'strategy': 'full'}
+
+llmcodec decode-bits 100000110001100100101001101001100010011110110101001011111001100101 \
+    --model runs/default/model.pt
+# bits      : 100000110001100100101001101001100010011110110101001011111001100101
+# value     : 0.512102611892
+# text      : 'the cat sat'
+```
+
+(The exact bits depend on the checkpoint; the layout above is what the commands
+print.)
+
+The bit string's **length is the grid depth `n`** and its binary value is the
+cell index `k`, so leading zeros are significant — pass the string exactly as
+`encode-bits` printed it. Give the same `--mode` / `--n` / `--coverage` options
+to both directions: the decoder must rebuild the identical candidate sets.
+
 ## Python API
 
 ```python
@@ -314,6 +514,12 @@ print(enc.as_float)             # a real in [0, 1]
 print(enc.value)                # the exact Fraction
 print(float(enc.interval.width))  # how "confident" the code is
 print(codec.decode(enc.value))  # 'the cat sat on the mat.'
+
+# ... or as a dyadic bit code (see "Binary encoding" above)
+bits = codec.encode_bits("the cat sat on the mat.")
+print(bits.bits)                # a '0'/'1' string of length bits.n
+print(bits.value)               # exact Fraction inside the interval
+print(codec.decode_bits(bits))  # 'the cat sat on the mat.'
 ```
 
 See [`examples/encode_decode.py`](examples/encode_decode.py) for a runnable demo
@@ -327,6 +533,8 @@ See [`examples/encode_decode.py`](examples/encode_decode.py) for a runnable demo
 | `encode` | `TEXT`, `--model`, `--mode`, `--n`, `--max-n`, `--coverage` |
 | `decode` | `VALUE`, `--exact`, `--model`, `--mode`, `--n`, `--max-n`, `--coverage` |
 | `roundtrip` | `TEXT`, `--model`, `--mode`, `--n`, `--max-n`, `--coverage` |
+| `encode-bits` | `TEXT`, `--model`, `--mode`, `--n`, `--max-n`, `--coverage` |
+| `decode-bits` | `BITS`, `--model`, `--mode`, `--n`, `--max-n`, `--coverage` |
 
 Run `llmcodec <command> --help` for the full help text.
 

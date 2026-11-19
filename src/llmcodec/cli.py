@@ -1,6 +1,6 @@
 """Command-line interface.
 
-Exposes four subcommands:
+Exposes six subcommands:
 
 ``llmcodec train``
     Train the tiny language model.
@@ -13,6 +13,12 @@ Exposes four subcommands:
 
 ``llmcodec roundtrip TEXT``
     Encode then decode and report whether the result matches the input.
+
+``llmcodec encode-bits TEXT``
+    Encode a sentence to a dyadic :class:`~llmcodec.interval.BitCode`.
+
+``llmcodec decode-bits BITS``
+    Decode a :class:`~llmcodec.interval.BitCode` back to a sentence.
 """
 
 import argparse
@@ -21,6 +27,7 @@ from fractions import Fraction
 
 from .candidates import build_selector
 from .codec import Codec, NotEncodableError
+from .interval import BitCode
 from .model import TinyLM
 from .train import TrainConfig
 from .train import train as train_run
@@ -118,6 +125,63 @@ def _cmd_roundtrip(args):
   print(f"decoded   : {decoded!r}")
   print(f"match     : {ok}")
   return 0 if ok else 1
+
+
+def _parse_bits(text):
+  """Parse a ``0``/``1`` string into a :class:`~llmcodec.interval.BitCode`.
+
+  The length of the string is the grid depth ``n`` and its binary value is the
+  cell index ``k``; leading zeros are therefore significant.
+
+  Args:
+    text: A non-empty string of ``0`` and ``1`` characters.
+
+  Returns:
+    The corresponding :class:`~llmcodec.interval.BitCode`.
+
+  Raises:
+    ValueError: If ``text`` is empty or contains a character other than
+      ``0``/``1``.
+  """
+  if not text or set(text) - {"0", "1"}:
+    raise ValueError("bits must be a non-empty string of 0s and 1s")
+  return BitCode(len(text), int(text, 2))
+
+
+def _cmd_encode_bits(args):
+  """Handle the ``encode-bits`` subcommand."""
+  codec = _make_codec(args)
+  try:
+    code = codec.encode_bits(args.text)
+  except NotEncodableError as exc:
+    print(f"encode-bits failed: {exc}")
+    print("hint: use --mode full (lossless) or a larger --n / --coverage")
+    return 1
+  print(f"text      : {args.text!r}")
+  print(f"bits      : {code.bits}")
+  print(f"n         : {code.n}")
+  print(f"k         : {code.k}")
+  print(f"value     : {float(code.value):.12f}")
+  print(f"fraction  : {code.value}")
+  print(f"cell      : {code.cell}")
+  print(f"selector  : {codec.selector.describe()}")
+  return 0
+
+
+def _cmd_decode_bits(args):
+  """Handle the ``decode-bits`` subcommand."""
+  codec = _make_codec(args)
+  try:
+    code = _parse_bits(args.bits)
+    text = codec.decode_bits(code)
+  except (ValueError, RuntimeError) as exc:
+    # ValueError covers both an unparsable bit string and NotEncodableError.
+    print(f"decode-bits failed: {exc}")
+    return 1
+  print(f"bits      : {code.bits}")
+  print(f"value     : {float(code.value):.12f}")
+  print(f"text      : {text!r}")
+  return 0
 
 
 def add_codec_args(parser):
@@ -245,6 +309,17 @@ def build_parser():
   p_rt.add_argument("text", help="the sentence to round-trip")
   add_codec_args(p_rt)
   p_rt.set_defaults(func=_cmd_roundtrip)
+
+  p_encb = sub.add_parser("encode-bits", help="encode a sentence to a dyadic BitCode")
+  p_encb.add_argument("text", help="the sentence to encode")
+  add_codec_args(p_encb)
+  p_encb.set_defaults(func=_cmd_encode_bits)
+
+  p_decb = sub.add_parser("decode-bits",
+                          help="decode a dyadic BitCode back to a sentence")
+  p_decb.add_argument("bits", help="a 0/1 string; its length is the grid depth N")
+  add_codec_args(p_decb)
+  p_decb.set_defaults(func=_cmd_decode_bits)
 
   return parser
 

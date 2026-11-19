@@ -26,6 +26,93 @@ from fractions import Fraction
 from math import gcd
 
 
+class BitCode(namedtuple("BitCode", "n k")):
+  """A dyadic-cell binary code: ``n`` bits whose value is ``k / 2**n``.
+
+  A :class:`BitCode` is the *concrete* form of an :class:`Interval`.  It names
+  the dyadic cell ``[k / 2**n, (k + 1) / 2**n]`` -- a sub-interval of ``[0, 1]``
+  whose endpoints are multiples of ``2**-n`` -- that is fully contained in the
+  interval it was derived from.  Because the whole cell lies inside the source
+  interval, *every* point of the cell is a valid code for the same sentence, so
+  the code is safe to store and decode without any rounding caveats.
+
+  The two fields are the only state:
+
+  Attributes:
+    n: The number of bits, i.e. the grid depth.  ``n == 0`` only for the unit
+      interval ``[0, 1]`` (see :meth:`Interval.dyadic`).
+    k: The cell index in ``[0, 2**n]``.  The cell is ``[k / 2**n, (k +
+      1) / 2**n]``.
+
+  Examples:
+    >>> BitCode(3, 3).bits
+    '011'
+    >>> BitCode(3, 3).value
+    Fraction(3, 8)
+    >>> BitCode(3, 3).width
+    Fraction(1, 8)
+    >>> BitCode(3, 3).cell.lower
+    Fraction(3, 8)
+  """
+
+  __slots__ = ()
+
+  @property
+  def bits(self):
+    """The code as a zero-padded bit string of exactly ``n`` characters.
+
+    The string is ``k`` written in binary with ``n`` digits; leading zeros are
+    significant because they encode the grid depth ``n``.  The unit interval --
+    the only source of ``n == 0`` -- yields the empty string.
+
+    Examples:
+      >>> BitCode(3, 3).bits
+      '011'
+      >>> BitCode(0, 0).bits
+      ''
+    """
+    return format(self.k, f"0{self.n}b") if self.n else ""
+
+  @property
+  def value(self):
+    """The lower edge of the cell as an exact :class:`~fractions.Fraction`.
+
+    This is a point *inside* the source interval (it is at or above its lower
+    bound), so it is a valid code for the sentence.  It is always exact; never
+    convert it to ``float`` for storage or decoding.
+
+    Examples:
+      >>> BitCode(3, 3).value
+      Fraction(3, 8)
+    """
+    return Fraction(self.k, 1 << self.n)
+
+  @property
+  def width(self):
+    """The width of the cell, ``2**-n``, as an exact :class:`~fractions.Fraction`.
+
+    Examples:
+      >>> BitCode(3, 3).width
+      Fraction(1, 8)
+    """
+    return Fraction(1, 1 << self.n)
+
+  @property
+  def cell(self):
+    """The dyadic cell itself, as an :class:`Interval`.
+
+    The cell ``[k / 2**n, (k + 1) / 2**n]`` is contained in the interval the
+    code was derived from, and any point inside it decodes to the same sentence.
+
+    Examples:
+      >>> BitCode(3, 3).cell.lower
+      Fraction(3, 8)
+      >>> BitCode(3, 3).cell.upper
+      Fraction(1, 2)
+    """
+    return Interval(self.k, self.k + 1, 1 << self.n)
+
+
 class Interval(namedtuple("Interval", "num_lo num_hi den")):
   """A closed rational interval ``[num_lo / den, num_hi / den]``.
 
@@ -158,6 +245,52 @@ class Interval(namedtuple("Interval", "num_lo num_hi den")):
       False
     """
     return self.lower <= value <= self.upper
+
+  def dyadic(self):
+    """Return the smallest :class:`BitCode` cell contained in the interval.
+
+    Cut ``[0, 1]`` into ``2**n`` equal *dyadic cells* for ``n = 0, 1, 2, ...``
+    and pick the coarsest cell that is **entirely contained** in ``self``.  The
+    result is a :class:`BitCode` ``(n, k)`` naming the cell ``[k / 2**n,
+    (k + 1) / 2**n]``.
+
+    The cell is contained, so any point of it -- in particular the code's own
+    :attr:`~BitCode.value` ``k / 2**n`` -- lies inside ``self`` and therefore
+    decodes to the same sentence.  This is what makes the binary code safe: it
+    never relies on staying clear of an interval boundary.
+
+    Containment needs a cell of width ``2**-n`` to fit in a width ``w = hi -
+    lo``, so ``n >= ceil(-log2(w))``; the returned ``n`` is the smallest such
+    value (0 to 2 bits above the information-theoretic optimum).  The unit
+    interval returns ``BitCode(0, 0)``; the width of ``self`` must be positive.
+
+    Returns:
+      The :class:`BitCode` for the coarsest contained dyadic cell.
+
+    Raises:
+      ValueError: If the interval has zero width, so no cell can be contained.
+
+    Examples:
+      >>> Interval(9, 15, 25).dyadic()
+      BitCode(n=3, k=3)
+      >>> Interval(9, 15, 25).dyadic().bits
+      '011'
+      >>> Interval(0, 1, 1).dyadic()
+      BitCode(n=0, k=0)
+    """
+    span = self.num_hi - self.num_lo
+    if span <= 0:
+      raise ValueError("a zero-width interval contains no dyadic cell")
+    # Smallest n with 2**n >= den / span, i.e. cell width 1 / 2**n <= span.
+    # The closed form lands on the answer or one short; the loop settles it.
+    n = (-(-self.den // span) - 1).bit_length()
+    while True:
+      step = 1 << n
+      # k = ceil(lo * 2**n), the left edge of the leftmost candidate cell.
+      k = -(-(self.num_lo * step) // self.den)
+      if (k + 1) * self.den <= self.num_hi * step:
+        return BitCode(n, k)
+      n += 1
 
   def subdivide(self, counts, index):
     """Return the ``index``-th slice of ``self`` under integer ``counts``.

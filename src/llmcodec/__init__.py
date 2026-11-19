@@ -13,6 +13,8 @@ Public API:
   :class:`~llmcodec.codec.Codec` / :class:`~llmcodec.codec.Encoded` /
   :class:`~llmcodec.codec.NotEncodableError`
     The encoder/decoder.
+  :class:`~llmcodec.interval.Interval` / :class:`~llmcodec.interval.BitCode`
+    Exact rational intervals and their dyadic binary codes.
   :func:`~llmcodec.candidates.build_selector` and the selector classes
     Pluggable candidate-set strategies (``full``, ``topn``, ``adaptive``).
   :mod:`llmcodec.device`
@@ -35,12 +37,13 @@ from .device import (
     resolve_amp_dtype,
     resolve_device,
 )
-from .interval import Interval
+from .interval import BitCode, Interval
 from .model import ModelConfig, TinyLM
 from .vocab import DEFAULT_VOCAB, Vocab
 
 __all__ = [
     "AdaptiveSelector",
+    "BitCode",
     "CandidateSet",
     "CandidateSelector",
     "Codec",

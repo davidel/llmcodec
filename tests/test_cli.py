@@ -43,3 +43,37 @@ def test_cli_roundtrip(checkpoint, capsys):
   assert code == 0
   out = capsys.readouterr().out
   assert "match     : True" in out
+
+
+@pytest.mark.slow
+def test_cli_encode_bits(checkpoint, capsys):
+  """``encode-bits`` prints the bit string, length and cell."""
+  code = main(["encode-bits", "--model", checkpoint, "--mode", "full", "the cat"])
+  assert code == 0
+  out = capsys.readouterr().out
+  assert "bits      : " in out
+  assert "n         : " in out
+  assert "cell      : " in out
+
+
+@pytest.mark.slow
+def test_cli_decode_bits_roundtrip(checkpoint, capsys):
+  """A BitCode printed by ``encode-bits`` decodes back via ``decode-bits``."""
+  assert main(["encode-bits", "--model", checkpoint, "--mode", "full", "the cat"]) == 0
+  bits = None
+  for line in capsys.readouterr().out.splitlines():
+    if line.startswith("bits      : "):
+      bits = line.split(": ", 1)[1].strip()
+  assert bits
+  code = main(["decode-bits", "--model", checkpoint, "--mode", "full", bits])
+  assert code == 0
+  out = capsys.readouterr().out
+  assert "text      : 'the cat'" in out
+
+
+@pytest.mark.slow
+def test_cli_decode_bits_rejects_garbage(checkpoint, capsys):
+  """A non-binary argument makes ``decode-bits`` fail with a hint."""
+  code = main(["decode-bits", "--model", checkpoint, "--mode", "full", "0102"])
+  assert code == 1
+  assert "decode-bits failed" in capsys.readouterr().out
