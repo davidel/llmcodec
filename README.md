@@ -436,10 +436,29 @@ llmcodec train --source tinystories --max-stories 200000 --steps 50000 \
 
 # quick offline smoke run (no network, tiny model)
 llmcodec train --source sample --steps 200 --out-dir runs/sample
+
+# bigger architecture for a GPU: 12 layers, 768 wide
+llmcodec train --source tinystories --steps 50000 --device cuda \
+    --d-model 768 --n-layers 12 --n-heads 12 --d-ff 3072 \
+    --out-dir runs/big
+
+# start from a JSON config (see configs/default.json); flags override it
+llmcodec train --config configs/default.json --steps 20000 --out-dir runs/short
 ```
 
-`runs/default/train_config.json` records the exact configuration (including the
-vocabulary) for reproducibility.
+The configuration precedence is: built-in defaults < `--config` file <
+explicit flags. The file may be a flat `TrainConfig` dump (the shape of
+`configs/default.json`) or the wrapped `{"train": ..., "vocab": ...}` shape
+written to `train_config.json`, so a previous run's config can be replayed with
+`tweak` flags on top. `runs/default/train_config.json` records the exact
+configuration (including the vocabulary) for reproducibility.
+
+`block_size` must not exceed the model's `max_seq_len` (256 by default; raise
+`--max-seq-len` together with `--block-size` for longer contexts), and
+`n_heads` must divide `d_model`. `train` checks both up front and exits with an
+explanatory error instead of failing deep inside `torch`. There is no
+`--vocab-size` flag on purpose: the vocabulary is fixed at 43 tokens so that
+checkpoints stay decodable.
 
 > **CPU budget.** A 6×512 transformer trains at roughly 6–8k tokens/s on a
 > typical CPU, so the full 50k-step run above is a multi-hour job. Use
@@ -529,7 +548,7 @@ See [`examples/encode_decode.py`](examples/encode_decode.py) for a runnable demo
 
 | command | arguments |
 |---------|-----------|
-| `train` | `--source`, `--max-stories`, `--steps`, `--batch-size`, `--block-size`, `--lr`, `--warmup-steps`, `--log-every`, `--eval-every`, `--out-dir`, `--device`, `--num-threads`, `--seed` |
+| `train` | `--config`, `--source`, `--split`, `--max-stories`, `--steps`, `--batch-size`, `--block-size`, `--lr`, `--min-lr`, `--warmup-steps`, `--weight-decay`, `--beta1`, `--beta2`, `--grad-clip`, `--log-every`, `--eval-every`, `--eval-batches`, `--out-dir`, `--device`, `--amp`/`--no-amp`, `--amp-dtype`, `--num-threads`, `--seed`, `--d-model`, `--n-layers`, `--n-heads`, `--d-ff`, `--max-seq-len`, `--dropout` |
 | `encode` | `TEXT`, `--model`, `--mode`, `--n`, `--max-n`, `--coverage` |
 | `decode` | `VALUE`, `--exact`, `--model`, `--mode`, `--n`, `--max-n`, `--coverage` |
 | `roundtrip` | `TEXT`, `--model`, `--mode`, `--n`, `--max-n`, `--coverage` |
@@ -561,6 +580,9 @@ Run `llmcodec <command> --help` for the full help text.
 | `eval_every` | `500` | validation cadence (0 disables) |
 | `out_dir` | `"runs/default"` | checkpoint directory |
 | `num_threads` | `0` | torch CPU threads (0 = default) |
+
+Every field can be set from the `train` CLI either directly (for example
+`--steps`) or through a `--config` JSON file; explicit flags win over the file.
 
 ### `ModelConfig`
 

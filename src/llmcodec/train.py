@@ -12,11 +12,13 @@ token stream so the run reports a held-out loss without needing a second
 download.
 """
 
+import argparse
 import json
 import logging
 import math
 import os
 import time
+from types import SimpleNamespace
 
 import torch
 import torch.nn.functional as F
@@ -132,6 +134,298 @@ class TrainConfig:
     data["model"] = self.model.to_dict()
     return data
 
+  @classmethod
+  def from_dict(cls, data, base=None):
+    """Build a configuration from a dictionary, ignoring unknown keys.
+
+    The dictionary may be flat (the shape of :meth:`to_dict`) or wrapped as
+    ``{"train": {...}, "vocab": {...}}``, which is the shape written to
+    ``train_config.json`` by :func:`train`.  The ``vocab`` block is ignored
+    because the vocabulary is fixed by the codec.
+
+    Args:
+      data: A mapping of configuration fields.  A ``"model"`` sub-mapping holds
+        the architecture hyper-parameters.
+      base: An optional existing :class:`TrainConfig` to use as the starting
+        point.  Fields absent from ``data`` keep their ``base`` value.  Defaults
+        to a fresh :class:`TrainConfig`, so absent fields take the defaults.
+
+    Returns:
+      A new :class:`TrainConfig` instance.
+    """
+    if "train" in data:
+      data = data["train"]
+    base = base or cls()
+    fields = {name: data[name] for name in cls.FIELDS if name in data}
+    model = base.model
+    if "model" in data:
+      model = ModelConfig.from_dict(data["model"])
+    return cls(**{**fields, "model": model})
+
+  def validate(self, vocab=None):
+    """Check the configuration for combinations that would fail later.
+
+    Catching these here turns a confusing crash deep inside ``torch`` into an
+    actionable message.
+
+    Args:
+      vocab: The vocabulary the model will use.  When given, its size must match
+        ``model.vocab_size`` or the checkpoint would not decode.
+
+    Raises:
+      ValueError: If the architecture or training settings are inconsistent.
+    """
+    model = self.model
+    if model.d_model % model.n_heads != 0:
+      raise ValueError(f"d_model ({model.d_model}) must be divisible by "
+                       f"n_heads ({model.n_heads})")
+    if self.block_size > model.max_seq_len:
+      raise ValueError(f"block_size ({self.block_size}) exceeds max_seq_len "
+                       f"({model.max_seq_len})")
+    if vocab is not None and model.vocab_size != vocab.vocab_size:
+      raise ValueError(f"model.vocab_size ({model.vocab_size}) does not match "
+                       f"the vocabulary size ({vocab.vocab_size})")
+    if not 0.0 <= model.dropout < 1.0:
+      raise ValueError(f"dropout ({model.dropout}) must be in [0, 1)")
+    if self.steps < 1:
+      raise ValueError(f"steps ({self.steps}) must be positive")
+    if self.batch_size < 1:
+      raise ValueError(f"batch_size ({self.batch_size}) must be positive")
+
+
+def _read_config_json(path):
+  """Read a training-config JSON file into a plain dictionary.
+
+  Args:
+    path: Path to the JSON file.  Both the flat shape of
+      :meth:`TrainConfig.to_dict` and the wrapped ``{"train": ..., "vocab": ...}``
+      shape written by :func:`train` are accepted.
+
+  Returns:
+    The configuration mapping, with any outer ``"train"`` wrapper removed.
+
+  Raises:
+    ValueError: If the file cannot be read, is not valid JSON, or is not an
+      object.
+  """
+  try:
+    with open(path, "r", encoding="utf-8") as fh:
+      data = json.load(fh)
+  except OSError as exc:
+    raise ValueError(f"could not read config file {path!r}: {exc}") from exc
+  except json.JSONDecodeError as exc:
+    raise ValueError(f"config file {path!r} is not valid JSON: {exc}") from exc
+  if not isinstance(data, dict):
+    raise ValueError(f"config file {path!r} must contain a JSON object")
+  if "train" in data:
+    data = data["train"]
+    if not isinstance(data, dict):
+      raise ValueError(f"config file {path!r} has a non-object 'train' section")
+  return data
+
+
+def load_config(path):
+  """Load a :class:`TrainConfig` from a JSON file.
+
+  Args:
+    path: Path to a JSON config file.  See :func:`_read_config_json` for the
+      accepted shapes.
+
+  Returns:
+    A new :class:`TrainConfig` populated from the file.
+
+  Raises:
+    ValueError: If the file cannot be read or parsed.
+  """
+  return TrainConfig.from_dict(_read_config_json(path))
+
+
+def merged_config(args):
+  """Merge an optional ``--config`` file with the explicit CLI flags.
+
+  Precedence is ``TrainConfig`` defaults < ``--config`` file < explicit flags.
+  Every train flag defaults to ``None`` so that "not given" stays
+  distinguishable from "set to the default value"; only non-``None`` attributes
+  are carried over.  Architecture flags are nested under ``"model"``.
+
+  Args:
+    args: A parsed argument namespace.  Missing attributes are treated as unset.
+
+  Returns:
+    A :class:`types.SimpleNamespace` holding the merged raw configuration.
+  """
+  config_path = getattr(args, "config", None)
+  raw = dict(_read_config_json(config_path)) if config_path is not None else {}
+  raw["model"] = dict(raw.get("model", {}))
+  for name in TrainConfig.FIELDS:
+    value = getattr(args, name, None)
+    if value is not None:
+      raw[name] = value
+  for name in ModelConfig.FIELDS:
+    value = getattr(args, name, None)
+    if value is not None:
+      raw["model"][name] = value
+  return SimpleNamespace(**raw)
+
+
+def config_from_args(args):
+  """Build a :class:`TrainConfig` from parsed CLI arguments.
+
+  Args:
+    args: A parsed argument namespace, as produced by :func:`add_train_arguments`.
+
+  Returns:
+    A new :class:`TrainConfig` with the ``--config`` file and explicit flags
+    merged in.
+
+  Raises:
+    ValueError: If the ``--config`` file cannot be read or parsed.
+  """
+  return TrainConfig.from_dict(vars(merged_config(args)))
+
+
+def add_train_arguments(parser):
+  """Register the ``train`` flags on ``parser``.
+
+  Every flag defaults to ``None`` so that "not given" stays distinguishable from
+  "set to the default value"; that is what lets an explicit flag override a
+  ``--config`` file while unset flags keep the file's value.  See
+  :func:`merged_config`.
+
+  Args:
+    parser: The parser (or subparser) to add the arguments to.
+  """
+  parser.add_argument(
+      "--config",
+      default=None,
+      help="JSON training config to use as the base; flags override it",
+  )
+  parser.add_argument(
+      "--source",
+      choices=["tinystories", "sample"],
+      default=None,
+      help="training corpus: 'tinystories' downloads it, 'sample' is offline "
+      "(default: tinystories)",
+  )
+  parser.add_argument("--split",
+                      default=None,
+                      help="dataset split to load (default: train)")
+  parser.add_argument(
+      "--max-stories",
+      type=int,
+      default=None,
+      help="cap on the number of stories to load from the corpus (default: 200000)",
+  )
+  parser.add_argument("--steps",
+                      type=int,
+                      default=None,
+                      help="number of optimizer steps to run (default: 50000)")
+  parser.add_argument("--batch-size",
+                      type=int,
+                      default=None,
+                      help="number of blocks per optimizer step (default: 64)")
+  parser.add_argument("--block-size",
+                      type=int,
+                      default=None,
+                      help="training context length in tokens (default: 256)")
+  parser.add_argument("--lr",
+                      type=float,
+                      default=None,
+                      help="peak learning rate (default: 3e-4)")
+  parser.add_argument(
+      "--min-lr",
+      type=float,
+      default=None,
+      help="final learning rate of the cosine schedule (default: 3e-5)",
+  )
+  parser.add_argument("--warmup-steps",
+                      type=int,
+                      default=None,
+                      help="linear warmup length (default: 500)")
+  parser.add_argument("--weight-decay",
+                      type=float,
+                      default=None,
+                      help="AdamW weight decay (default: 0.1)")
+  parser.add_argument("--beta1",
+                      type=float,
+                      default=None,
+                      help="AdamW beta1 (default: 0.9)")
+  parser.add_argument("--beta2",
+                      type=float,
+                      default=None,
+                      help="AdamW beta2 (default: 0.95)")
+  parser.add_argument("--grad-clip",
+                      type=float,
+                      default=None,
+                      help="gradient-norm clip value (default: 1.0)")
+  parser.add_argument("--log-every",
+                      type=int,
+                      default=None,
+                      help="print a loss line every N steps (default: 50)")
+  parser.add_argument(
+      "--eval-every",
+      type=int,
+      default=None,
+      help="run validation every N steps, 0 disables (default: 500)",
+  )
+  parser.add_argument("--eval-batches",
+                      type=int,
+                      default=None,
+                      help="batches per validation pass (default: 20)")
+  parser.add_argument(
+      "--out-dir",
+      default=None,
+      help="directory for the checkpoint and config (default: runs/default)",
+  )
+  parser.add_argument(
+      "--device",
+      default=None,
+      help="torch device: 'auto' (CUDA if available), 'cpu' or 'cuda' (default: auto)",
+  )
+  parser.add_argument(
+      "--amp",
+      action=argparse.BooleanOptionalAction,
+      default=None,
+      help="enable mixed-precision autocast (default: enabled)",
+  )
+  parser.add_argument(
+      "--amp-dtype",
+      choices=["auto", "float16", "bfloat16", "float32"],
+      default=None,
+      help="autocast dtype (default: auto)",
+  )
+  parser.add_argument("--num-threads",
+                      type=int,
+                      default=None,
+                      help="torch CPU threads (0 = library default)")
+  parser.add_argument("--seed", type=int, default=None, help="RNG seed (default: 1337)")
+  parser.add_argument("--d-model",
+                      type=int,
+                      default=None,
+                      help="embedding / residual-stream width (default: 512)")
+  parser.add_argument("--n-layers",
+                      type=int,
+                      default=None,
+                      help="number of transformer blocks (default: 6)")
+  parser.add_argument("--n-heads",
+                      type=int,
+                      default=None,
+                      help="attention heads; must divide d_model (default: 8)")
+  parser.add_argument("--d-ff",
+                      type=int,
+                      default=None,
+                      help="feed-forward sublayer width (default: 2048)")
+  parser.add_argument(
+      "--max-seq-len",
+      type=int,
+      default=None,
+      help="positional-embedding limit; must be >= block_size (default: 256)",
+  )
+  parser.add_argument("--dropout",
+                      type=float,
+                      default=None,
+                      help="dropout probability (default: 0.0)")
+
 
 def _lr_at(step, cfg):
   """Return the learning rate for a given step.
@@ -220,6 +514,7 @@ def train(cfg=None, vocab=None):
   """
   cfg = cfg or TrainConfig()
   vocab = vocab or DEFAULT_VOCAB
+  cfg.validate(vocab)
 
   device = resolve_device(cfg.device)
   amp_dtype = resolve_amp_dtype(cfg.amp_dtype, device)
@@ -327,66 +622,10 @@ def main(argv=None):
   logging.basicConfig(level=logging.INFO, format="[llmcodec] %(message)s")
 
   parser = argparse.ArgumentParser(description="Train the llmcodec TinyLM.")
-  parser.add_argument(
-      "--source",
-      choices=["tinystories", "sample"],
-      default="tinystories",
-      help="training corpus: 'tinystories' downloads it, 'sample' is offline",
-  )
-  parser.add_argument(
-      "--max-stories",
-      type=int,
-      default=200_000,
-      help="cap on the number of stories to load from the corpus",
-  )
-  parser.add_argument("--steps",
-                      type=int,
-                      default=50_000,
-                      help="number of optimizer steps to run")
-  parser.add_argument("--batch-size",
-                      type=int,
-                      default=64,
-                      help="number of blocks per optimizer step")
-  parser.add_argument("--block-size",
-                      type=int,
-                      default=256,
-                      help="training context length in tokens")
-  parser.add_argument("--lr", type=float, default=3e-4, help="peak learning rate")
-  parser.add_argument("--out-dir",
-                      default="runs/default",
-                      help="directory for the checkpoint and config")
-  parser.add_argument("--device",
-                      default="auto",
-                      help="torch device: 'auto' (CUDA if available), 'cpu' or 'cuda'")
-  parser.add_argument("--amp",
-                      action=argparse.BooleanOptionalAction,
-                      default=True,
-                      help="enable mixed-precision autocast (default: enabled)")
-  parser.add_argument("--amp-dtype",
-                      choices=["auto", "float16", "bfloat16", "float32"],
-                      default="auto",
-                      help="autocast dtype (default: float16 on CUDA, bfloat16 on CPU)")
-  parser.add_argument("--num-threads",
-                      type=int,
-                      default=0,
-                      help="torch CPU threads (0 = library default)")
-  parser.add_argument("--seed", type=int, default=1337, help="RNG seed")
+  add_train_arguments(parser)
   args = parser.parse_args(argv)
 
-  cfg = TrainConfig(
-      source=args.source,
-      max_stories=args.max_stories,
-      steps=args.steps,
-      batch_size=args.batch_size,
-      block_size=args.block_size,
-      lr=args.lr,
-      out_dir=args.out_dir,
-      device=args.device,
-      amp=args.amp,
-      amp_dtype=args.amp_dtype,
-      num_threads=args.num_threads,
-      seed=args.seed,
-  )
+  cfg = config_from_args(args)
   train(cfg)
   return 0
 

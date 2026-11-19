@@ -29,7 +29,7 @@ from .candidates import build_selector
 from .codec import Codec, NotEncodableError
 from .interval import BitCode
 from .model import TinyLM
-from .train import TrainConfig
+from .train import add_train_arguments, config_from_args
 from .train import train as train_run
 from .vocab import DEFAULT_VOCAB
 
@@ -56,23 +56,11 @@ def _make_codec(args):
 
 def _cmd_train(args):
   """Handle the ``train`` subcommand."""
-  cfg = TrainConfig(
-      source=args.source,
-      max_stories=args.max_stories,
-      steps=args.steps,
-      batch_size=args.batch_size,
-      block_size=args.block_size,
-      lr=args.lr,
-      warmup_steps=args.warmup_steps,
-      log_every=args.log_every,
-      eval_every=args.eval_every,
-      out_dir=args.out_dir,
-      device=args.device,
-      amp=args.amp,
-      amp_dtype=args.amp_dtype,
-      num_threads=args.num_threads,
-      seed=args.seed,
-  )
+  try:
+    cfg = config_from_args(args)
+  except ValueError as exc:
+    print(f"train failed: {exc}")
+    return 1
   train_run(cfg)
   return 0
 
@@ -232,61 +220,7 @@ def build_parser():
   sub = parser.add_subparsers(dest="command", required=True)
 
   p_train = sub.add_parser("train", help="train the tiny language model")
-  p_train.add_argument(
-      "--source",
-      choices=["tinystories", "sample"],
-      default="tinystories",
-      help="training corpus: 'tinystories' downloads it, 'sample' is offline",
-  )
-  p_train.add_argument("--max-stories",
-                       type=int,
-                       default=200_000,
-                       help="cap on the number of stories to load")
-  p_train.add_argument("--steps",
-                       type=int,
-                       default=50_000,
-                       help="number of optimizer steps")
-  p_train.add_argument("--batch-size",
-                       type=int,
-                       default=64,
-                       help="blocks per optimizer step")
-  p_train.add_argument("--block-size",
-                       type=int,
-                       default=256,
-                       help="training context length in tokens")
-  p_train.add_argument("--lr", type=float, default=3e-4, help="peak learning rate")
-  p_train.add_argument("--warmup-steps",
-                       type=int,
-                       default=500,
-                       help="linear warmup length")
-  p_train.add_argument("--log-every",
-                       type=int,
-                       default=50,
-                       help="print a loss line every N steps")
-  p_train.add_argument("--eval-every",
-                       type=int,
-                       default=500,
-                       help="run validation every N steps (0 disables)")
-  p_train.add_argument("--out-dir",
-                       default="runs/default",
-                       help="directory for checkpoint and config")
-  p_train.add_argument("--device",
-                       default="auto",
-                       help="torch device: 'auto' (CUDA if available), 'cpu' or 'cuda'")
-  p_train.add_argument("--amp",
-                       action=argparse.BooleanOptionalAction,
-                       default=True,
-                       help="enable mixed-precision autocast (default: enabled)")
-  p_train.add_argument(
-      "--amp-dtype",
-      choices=["auto", "float16", "bfloat16", "float32"],
-      default="auto",
-      help="autocast dtype (default: float16 on CUDA, bfloat16 on CPU)")
-  p_train.add_argument("--num-threads",
-                       type=int,
-                       default=0,
-                       help="torch CPU threads (0 = default)")
-  p_train.add_argument("--seed", type=int, default=1337, help="RNG seed")
+  add_train_arguments(p_train)
   p_train.set_defaults(func=_cmd_train)
 
   p_enc = sub.add_parser("encode", help="encode a sentence to a real in [0, 1]")

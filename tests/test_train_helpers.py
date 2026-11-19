@@ -7,13 +7,122 @@ round-trip, token preparation and the checkpoint written by ``train``.
 
 import json
 import os
+from types import SimpleNamespace
 
 import pytest
 import torch
 
 from llmcodec.model import ModelConfig
-from llmcodec.train import TrainConfig, _lr_at, _prepare_tokens, train
+from llmcodec.train import (
+    TrainConfig,
+    _lr_at,
+    _prepare_tokens,
+    add_train_arguments,
+    config_from_args,
+    load_config,
+    train,
+)
 from llmcodec.vocab import DEFAULT_VOCAB
+
+
+def test_from_dict_roundtrip():
+  """``from_dict(to_dict())`` reproduces the configuration."""
+  cfg = TrainConfig(steps=11,
+                    lr=0.25,
+                    source="sample",
+                    model=ModelConfig(vocab_size=43,
+                                      d_model=32,
+                                      n_layers=2,
+                                      n_heads=2,
+                                      d_ff=64))
+  assert TrainConfig.from_dict(cfg.to_dict()).to_dict() == cfg.to_dict()
+
+
+def test_from_dict_accepts_wrapped_form():
+  """The ``{"train": ..., "vocab": ...}`` shape loads and ignores the vocab."""
+  wrapped = {"train": TrainConfig(steps=9).to_dict(), "vocab": {"size": 43}}
+  assert TrainConfig.from_dict(wrapped).steps == 9
+
+
+def test_from_dict_ignores_unknown_keys():
+  """Unknown keys are dropped, matching ``ModelConfig.from_dict``."""
+  assert TrainConfig.from_dict({"steps": 4, "bogus": 1}).steps == 4
+
+
+def test_validate_rejects_bad_architecture():
+  """``validate`` turns misconfigurations into actionable errors."""
+  with pytest.raises(ValueError, match="divisible"):
+    TrainConfig(model=ModelConfig(vocab_size=43, n_heads=5)).validate()
+  with pytest.raises(ValueError, match="exceeds max_seq_len"):
+    TrainConfig(block_size=300).validate()
+  with pytest.raises(ValueError, match="vocabulary size"):
+    TrainConfig(model=ModelConfig(vocab_size=10)).validate(DEFAULT_VOCAB)
+  with pytest.raises(ValueError, match="dropout"):
+    TrainConfig(model=ModelConfig(vocab_size=43, dropout=1.0)).validate()
+  with pytest.raises(ValueError, match="steps"):
+    TrainConfig(steps=0).validate()
+  with pytest.raises(ValueError, match="batch_size"):
+    TrainConfig(batch_size=0).validate()
+
+
+def test_config_from_args_defaults():
+  """A namespace with only ``config=None`` yields the default config."""
+  cfg = config_from_args(SimpleNamespace(config=None))
+  assert cfg.to_dict() == TrainConfig().to_dict()
+
+
+def test_config_from_args_flag_overrides(tmp_path):
+  """Explicit flags beat ``--config`` values; unset flags keep file values."""
+  path = tmp_path / "cfg.json"
+  path.write_text(json.dumps({"steps": 123, "lr": 0.01, "batch_size": 8}))
+  args = SimpleNamespace(config=str(path), steps=7)
+  cfg = config_from_args(args)
+  assert cfg.steps == 7
+  assert cfg.lr == 0.01
+  assert cfg.batch_size == 8
+
+
+def test_config_from_args_missing_file():
+  """A bad ``--config`` path raises a clear error."""
+  with pytest.raises(ValueError, match="could not read config file"):
+    config_from_args(SimpleNamespace(config="does/not/exist.json"))
+
+
+def test_config_from_args_invalid_json(tmp_path):
+  """Malformed JSON raises a clear error."""
+  path = tmp_path / "bad.json"
+  path.write_text("{not json")
+  with pytest.raises(ValueError, match="not valid JSON"):
+    config_from_args(SimpleNamespace(config=str(path)))
+
+
+def test_cli_flags_reach_model_config():
+  """The architecture flags populate ``ModelConfig`` through the CLI parser."""
+  import argparse
+
+  parser = argparse.ArgumentParser()
+  add_train_arguments(parser)
+  args = parser.parse_args([
+      "--d-model", "64", "--n-layers", "2", "--n-heads", "4", "--d-ff", "128",
+      "--max-seq-len", "64", "--dropout", "0.1", "--steps", "5"
+  ])
+  cfg = config_from_args(args)
+  assert cfg.model.d_model == 64
+  assert cfg.model.n_layers == 2
+  assert cfg.model.n_heads == 4
+  assert cfg.model.d_ff == 128
+  assert cfg.model.max_seq_len == 64
+  assert cfg.model.dropout == 0.1
+  assert cfg.steps == 5
+  assert cfg.model.vocab_size == 43
+
+
+def test_load_config_configs_default():
+  """The shipped ``configs/default.json`` loads as-is."""
+  cfg = load_config("configs/default.json")
+  assert cfg.steps == 50_000
+  assert cfg.model.d_model == 512
+  assert cfg.model.n_layers == 6
 
 
 def test_train_config_to_dict_includes_model():
