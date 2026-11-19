@@ -172,6 +172,86 @@ def test_codec_rejects_model_tokenizer_mismatch():
           device="cpu")
 
 
+class _MinimalTokenizer:
+  """A hand-rolled ``TokenCodec`` with no BOS token, for the seed fallback.
+
+  Deliberately dependency-free: it exercises the codec's prefix seeding
+  without transformers, mirroring GPT-2-style BOS-less tokenizers.
+  """
+
+  def __init__(self):
+    self._tokens = ["<pad>", "<eos>", "<unk>", "a", "b", "c"]
+
+  def encode(self, text, add_bos=False, add_eos=False):
+    del add_bos, add_eos
+    return [3 + "abc".index(ch) for ch in text]
+
+  def decode(self, ids, skip_special=False):
+    del skip_special
+    return "".join(self._tokens[i] for i in ids)
+
+  @property
+  def itos(self):
+    return self._tokens
+
+  @property
+  def vocab_size(self):
+    return len(self._tokens)
+
+  @property
+  def bos_id(self):
+    return None
+
+  @property
+  def eos_id(self):
+    return 1
+
+  @property
+  def unk_id(self):
+    return 2
+
+
+def test_bos_less_tokenizer_seeds_prefix_with_eos():
+  """GPT-2-style tokenizers (no BOS) seed the prefix with EOS instead."""
+  from llmcodec.model import ModelConfig, TinyLM
+
+  model = TinyLM(
+      ModelConfig(vocab_size=6,
+                  d_model=16,
+                  n_layers=1,
+                  n_heads=2,
+                  d_ff=32,
+                  max_seq_len=32))
+  codec = Codec(model,
+                _MinimalTokenizer(),
+                build_selector("adaptive", max_n=8, coverage=0.999),
+                device="cpu")
+  enc = codec.encode("abcab")
+  assert codec.decode(enc.value) == "abcab"
+
+
+def test_tokenizer_without_bos_and_eos_is_rejected():
+  """No seed exists when a tokenizer defines neither BOS nor EOS."""
+  from llmcodec.model import ModelConfig, TinyLM
+
+  class _NoSeed(_MinimalTokenizer):
+
+    @property
+    def eos_id(self):
+      return None
+
+  model = TinyLM(
+      ModelConfig(vocab_size=6,
+                  d_model=16,
+                  n_layers=1,
+                  n_heads=2,
+                  d_ff=32,
+                  max_seq_len=32))
+  codec = Codec(model, _NoSeed(), build_selector("topn", n=4), device="cpu")
+  with pytest.raises(ValueError, match="neither <bos> nor <eos>"):
+    codec.encode("abc")
+
+
 def test_load_codec_model_requires_exactly_one_source():
   """``--model`` and ``--hf-model`` are mutually exclusive but one is needed."""
   from llmcodec.cli import _load_codec_model

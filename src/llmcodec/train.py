@@ -13,6 +13,7 @@ download.
 """
 
 import argparse
+import hashlib
 import json
 import logging
 import math
@@ -467,7 +468,12 @@ def _prepare_tokens(cfg, vocab):
     texts = load_tinystories(split=cfg.split, max_stories=cfg.max_stories)
   else:
     raise ValueError(f"unknown data source {cfg.source!r}")
-  return build_token_stream(texts, vocab)
+  add_bos = vocab.bos_id is not None
+  if not add_bos:
+    # BOS-less tokenizers (GPT-2 style) conventionally use EOS as the
+    # sequence-start token, which matches how the codec seeds its prefix.
+    logger.info("tokenizer has no <bos>; training sequences start with <eos>")
+  return build_token_stream(texts, vocab, add_bos=add_bos)
 
 
 @torch.no_grad()
@@ -595,8 +601,22 @@ def train(cfg=None, vocab=None):
       step += 1
 
   model.save(ckpt_path)
+  record = {"train": cfg.to_dict()}
+  tokenizer_name = getattr(vocab, "name", None)
+  if tokenizer_name is not None:
+    # An identity-addressed tokenizer (e.g. Hugging Face): record where to
+    # re-fetch it plus a hash of its id-to-token table, so decoding can
+    # verify it resolved the same vocabulary instead of trusting a name.
+    record["tokenizer"] = {
+        "name": tokenizer_name,
+        "revision": getattr(vocab, "revision", None),
+        "sha256": hashlib.sha256("\x1f".join(vocab.itos).encode()).hexdigest(),
+    }
+  else:
+    # The built-in character vocabulary: inline it exactly as before.
+    record["vocab"] = vocab.to_dict()
   with open(os.path.join(cfg.out_dir, "train_config.json"), "w") as fh:
-    json.dump({"train": cfg.to_dict(), "vocab": vocab.to_dict()}, fh, indent=2)
+    json.dump(record, fh, indent=2)
 
   final_val = evaluate(model,
                        val_dataset,

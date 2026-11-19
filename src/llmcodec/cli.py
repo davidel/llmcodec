@@ -22,7 +22,10 @@ Exposes six subcommands:
 """
 
 import argparse
+import hashlib
+import json
 import logging
+import os
 from fractions import Fraction
 
 from .candidates import build_selector
@@ -38,7 +41,13 @@ DEFAULT_SELECTOR_BY_VOCAB = 1000
 
 
 def _load_tokenizer(args):
-  """Load the tokenizer requested by ``--tokenizer`` (default: built-in).
+  """Resolve the tokenizer for a codec or training run.
+
+  Priority: an explicit ``--tokenizer`` beats the tokenizer recorded in the
+  checkpoint's ``train_config.json``, which beats the built-in character
+  vocabulary.  A recorded tokenizer is re-fetched from its identity and
+  verified against the content hash stored at training time, so a silently
+  drifted vocabulary fails loudly instead of corrupting decodes.
 
   Args:
     args: Parsed arguments; ``tokenizer`` may be absent (train subparser).
@@ -46,11 +55,56 @@ def _load_tokenizer(args):
   Returns:
     A :class:`~llmcodec.vocab.Vocab` or an
     :class:`~llmcodec.pretrained.HFTokenizer`.
+
+  Raises:
+    ValueError: If a recorded tokenizer's content hash does not match the
+      tokenizer that was re-fetched under the recorded identity.
   """
   name = getattr(args, "tokenizer", None)
-  if not name:
-    return DEFAULT_VOCAB
-  return HFTokenizer.load(name, device=getattr(args, "device", "auto"))
+  if name:
+    return HFTokenizer.load(name,
+                            revision=getattr(args, "revision", None),
+                            device=getattr(args, "device", "auto"))
+  recorded = _recorded_tokenizer(args)
+  if recorded is not None:
+    name, revision, digest = recorded
+    tokenizer = HFTokenizer.load(name,
+                                 revision=revision,
+                                 device=getattr(args, "device", "auto"))
+    if digest is not None:
+      actual = hashlib.sha256("\x1f".join(tokenizer.itos).encode()).hexdigest()
+      if actual != digest:
+        raise ValueError(f"tokenizer {name!r} does not match the one recorded at "
+                         "training time (content hash mismatch); pass --tokenizer "
+                         "explicitly to override")
+    return tokenizer
+  return DEFAULT_VOCAB
+
+
+def _recorded_tokenizer(args):
+  """Read the tokenizer identity recorded beside a trained checkpoint.
+
+  Args:
+    args: Parsed arguments carrying ``--model`` (may be absent).
+
+  Returns:
+    A ``(name, revision, sha256)`` tuple, or ``None`` when the checkpoint
+    has no recorded subword tokenizer.
+  """
+  model_path = getattr(args, "model", None)
+  if not model_path:
+    return None
+  config_path = os.path.join(os.path.dirname(os.path.abspath(model_path)),
+                             "train_config.json")
+  try:
+    with open(config_path) as fh:
+      record = json.load(fh)
+  except (OSError, json.JSONDecodeError):
+    return None
+  block = record.get("tokenizer")
+  if not isinstance(block, dict) or "name" not in block:
+    return None
+  return block["name"], block.get("revision"), block.get("sha256")
 
 
 def _load_codec_model(args):
@@ -117,10 +171,11 @@ def _cmd_train(args):
   """Handle the ``train`` subcommand."""
   try:
     cfg = config_from_args(args)
+    vocab = _load_tokenizer(args)
   except ValueError as exc:
     print(f"train failed: {exc}")
     return 1
-  train_run(cfg)
+  train_run(cfg, vocab=vocab)
   return 0
 
 
@@ -166,7 +221,14 @@ def _cmd_roundtrip(args):
     print(f"roundtrip failed: {exc}")
     print("hint: use --mode full (lossless) or a larger --n / --coverage")
     return 1
-  ok = decoded == args.text.lower()
+  # The built-in vocabulary lower-cases; subword tokenizers do not, so the
+  # expected text depends on which tokenizer produced the code.
+  tokenizer_name = getattr(args, "tokenizer", None)
+  if not tokenizer_name:
+    recorded = _recorded_tokenizer(args)
+    tokenizer_name = recorded[0] if recorded else None
+  expected = args.text if tokenizer_name else args.text.lower()
+  ok = decoded == expected
   print(f"text      : {args.text!r}")
   print(f"value     : {float(enc.value):.12f}")
   print(f"decoded   : {decoded!r}")
@@ -269,7 +331,9 @@ def add_codec_args(parser):
       default=None,
       help="Hugging Face tokenizer to use instead of the built-in character "
       "vocabulary, e.g. 'gpt2' (with a matching HF model, or a TinyLM "
-      "trained with the same tokenizer)",
+      "trained with the same tokenizer; on 'train' it selects the "
+      "tokenization of the training corpus and is recorded in "
+      "train_config.json so decode can re-fetch it)",
   )
   parser.add_argument(
       "--hf-model",

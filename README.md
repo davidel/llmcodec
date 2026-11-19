@@ -35,6 +35,7 @@ probability interval, and the final interval *is* the code.
 - [Install](#install)
 - [Train](#train)
 - [Encode / decode](#encode--decode)
+- [Pretrained models and custom tokenizers](#pretrained-models-and-custom-tokenizers)
 - [Python API](#python-api)
 - [CLI reference](#cli-reference)
 - [Configuration reference](#configuration-reference)
@@ -425,6 +426,9 @@ pip install torch --index-url https://download.pytorch.org/whl/cpu
 
 # the package (+ data & dev extras)
 pip install -e ".[all]"
+
+# optional: pretrained Hugging Face models and tokenizers
+pip install -e ".[hf]"
 ```
 
 ## Train
@@ -519,6 +523,71 @@ cell index `k`, so leading zeros are significant — pass the string exactly as
 `encode-bits` printed it. Give the same `--mode` / `--n` / `--coverage` options
 to both directions: the decoder must rebuild the identical candidate sets.
 
+## Pretrained models and custom tokenizers
+
+Any Hugging Face causal LM can drive the codec -- the coder only needs a
+next-token distribution, so a stronger model simply compresses better.  Any
+Hugging Face tokenizer can supply the vocabulary.  The two choices are
+independent; the only hard rule is that the model's logits must cover the
+tokenizer's id space, which the codec checks at construction.
+
+```bash
+# encode/decode with GPT-2 (first use downloads the checkpoint)
+pip install -e ".[hf]"
+llmcodec roundtrip "The cat sat on the mat." --hf-model gpt2 --tokenizer gpt2 \
+  --mode adaptive
+```
+
+```python
+from llmcodec.codec import Codec
+from llmcodec.candidates import build_selector
+from llmcodec.pretrained import HFCausalLM, HFTokenizer
+
+model = HFCausalLM.load("gpt2", dtype="float32", device="auto")
+vocab = HFTokenizer.load("gpt2")
+codec = Codec(model, vocab, build_selector("adaptive", max_n=32))
+enc = codec.encode("The cat sat on the mat.")
+print(enc.value)                 # exact Fraction in [0, 1]
+print(codec.decode(enc.value))   # the original text
+```
+
+### Training on a subword vocabulary
+
+`--tokenizer` trains the *tiny* model over subword tokens instead of
+characters; the trained checkpoint stays small but decodes with the same
+tokenizer automatically:
+
+```bash
+llmcodec train --tokenizer gpt2 --d-model 256 --n-layers 6 --n-heads 8 \
+  --d-ff 1024 --out-dir runs/bpe
+llmcodec roundtrip "The cat sat on the mat." --model runs/bpe/model.pt
+```
+
+`train_config.json` next to the checkpoint records the tokenizer identity
+(`name`, `revision`, `sha256` of its id-to-token table).  Decode-side, the
+tokenizer is re-fetched from that identity and verified against the hash, so
+a drifted vocabulary fails loudly instead of producing garbage.  Pass
+`--tokenizer` explicitly to override the recorded one.
+
+### Rules for reproducing a code
+
+- Use the **same model, same `--revision`** on both sides.
+- Use the **same `--hf-dtype`** (default `float32`); the softmax is always
+  computed in float32, but different inference dtypes still yield slightly
+  different logits, and the intervals will not match.
+- Use the same device class (CPU vs GPU rounding differs).
+- A tokenizer without `<bos>` (GPT-2 style) seeds its prefix with `<eos>`;
+  both encode and decode derive this automatically from the tokenizer.
+
+### Performance notes
+
+- Vocabularies of 1000+ tokens must use `--mode adaptive` (or `topn`);
+  the lossless `full` selector is rejected at that size.
+- For large vocabularies prefer `encode-bits`/`decode-bits`: the dyadic
+  bit code avoids the deep-nesting penalty of `Fraction` intervals.
+- With GPT-2-class models expect roughly 0.9-1.0 bits per character,
+  versus about 2.5-3 for the built-in character-level TinyLM.
+
 ## Python API
 
 ```python
@@ -548,12 +617,12 @@ See [`examples/encode_decode.py`](examples/encode_decode.py) for a runnable demo
 
 | command | arguments |
 |---------|-----------|
-| `train` | `--config`, `--source`, `--split`, `--max-stories`, `--steps`, `--batch-size`, `--block-size`, `--lr`, `--min-lr`, `--warmup-steps`, `--weight-decay`, `--beta1`, `--beta2`, `--grad-clip`, `--log-every`, `--eval-every`, `--eval-batches`, `--out-dir`, `--device`, `--amp`/`--no-amp`, `--amp-dtype`, `--num-threads`, `--seed`, `--d-model`, `--n-layers`, `--n-heads`, `--d-ff`, `--max-seq-len`, `--dropout` |
-| `encode` | `TEXT`, `--model`, `--mode`, `--n`, `--max-n`, `--coverage` |
-| `decode` | `VALUE`, `--exact`, `--model`, `--mode`, `--n`, `--max-n`, `--coverage` |
-| `roundtrip` | `TEXT`, `--model`, `--mode`, `--n`, `--max-n`, `--coverage` |
-| `encode-bits` | `TEXT`, `--model`, `--mode`, `--n`, `--max-n`, `--coverage` |
-| `decode-bits` | `BITS`, `--model`, `--mode`, `--n`, `--max-n`, `--coverage` |
+| `train` | `--config`, `--source`, `--split`, `--max-stories`, `--steps`, `--batch-size`, `--block-size`, `--lr`, `--min-lr`, `--warmup-steps`, `--weight-decay`, `--beta1`, `--beta2`, `--grad-clip`, `--log-every`, `--eval-every`, `--eval-batches`, `--out-dir`, `--device`, `--amp`/`--no-amp`, `--amp-dtype`, `--num-threads`, `--seed`, `--d-model`, `--n-layers`, `--n-heads`, `--d-ff`, `--max-seq-len`, `--dropout`, `--tokenizer` |
+| `encode` | `TEXT`, `--model` / `--hf-model`, `--tokenizer`, `--revision`, `--hf-dtype`, `--mode`, `--n`, `--max-n`, `--coverage`, `--device` |
+| `decode` | `VALUE`, `--exact`, `--model` / `--hf-model`, `--tokenizer`, `--revision`, `--hf-dtype`, `--mode`, `--n`, `--max-n`, `--coverage`, `--device` |
+| `roundtrip` | `TEXT`, `--model` / `--hf-model`, `--tokenizer`, `--revision`, `--hf-dtype`, `--mode`, `--n`, `--max-n`, `--coverage`, `--device` |
+| `encode-bits` | `TEXT`, `--model` / `--hf-model`, `--tokenizer`, `--revision`, `--hf-dtype`, `--mode`, `--n`, `--max-n`, `--coverage`, `--device` |
+| `decode-bits` | `BITS`, `--model` / `--hf-model`, `--tokenizer`, `--revision`, `--hf-dtype`, `--mode`, `--n`, `--max-n`, `--coverage`, `--device` |
 
 Run `llmcodec <command> --help` for the full help text.
 

@@ -181,6 +181,28 @@ class Codec:
                        f"vocabulary size {vocab.vocab_size}: the codec would index the "
                        "distribution with ids from the wrong table")
 
+  def _bos_seed(self):
+    """Return the id that seeds the coding prefix.
+
+    Normally ``<bos>``.  For tokenizers without a BOS token (GPT-2 style
+    byte-level BPE) the standard convention applies: EOS doubles as the
+    sequence-start token, so it seeds the prefix instead.  The seed is part
+    of the coded format: encode and decode must agree on it, which they do
+    automatically because both derive it from the same tokenizer.
+
+    Raises:
+      ValueError: If the tokenizer has neither BOS nor EOS, so no seed
+        exists at all.
+    """
+    seed = self.vocab.bos_id
+    if seed is None:
+      seed = self.vocab.eos_id
+    if seed is None:
+      raise ValueError(
+          "tokenizer has neither <bos> nor <eos>; the codec cannot seed its "
+          "prefix -- pick a tokenizer that defines at least one of them")
+    return seed
+
   def _probs(self, prefix_ids):
     """Return the next-token distribution for ``prefix_ids`` as a numpy array.
 
@@ -242,7 +264,7 @@ class Codec:
       NotEncodableError: If a token has no slice under the current selector.
     """
     char_ids = self.vocab.encode(text)
-    prefix = [self.vocab.bos_id]
+    prefix = [self._bos_seed()]
     interval = Interval.unit()
 
     for position, token_id in enumerate(char_ids):
@@ -344,7 +366,7 @@ class Codec:
     if not (0 <= code <= 1):
       raise ValueError("code must lie in [0, 1]")
 
-    prefix = [self.vocab.bos_id]
+    prefix = [self._bos_seed()]
     interval = Interval.unit()
     out = []
 
