@@ -14,6 +14,7 @@ therefore always computes the softmax in float32 (regardless of the model's
 inference dtype) and expects the same device/dtype/revision on both sides.
 """
 
+from abc import abstractmethod
 from typing import Protocol, runtime_checkable
 
 import torch
@@ -244,4 +245,226 @@ def load_hf_model(name_or_path, revision=None, dtype="float32", device=None):
   return HFCausalLM.load(name_or_path, revision=revision, dtype=dtype, device=device)
 
 
-__all__ = ["NextTokenModel", "HFCausalLM", "load_hf_model"]
+@runtime_checkable
+class TokenCodec(Protocol):
+  """Structural interface the codec expects from a tokenizer.
+
+  Implementations provide:
+
+  ``encode(text, add_bos=False, add_eos=False)``
+      Map text to a list of token ids.
+  ``decode(ids, skip_special=False)``
+      Map ids back to text.
+  ``vocab_size``, ``bos_id``, ``eos_id``, ``unk_id``
+      Sizes and special ids; ``vocab_size`` must match the model's.
+  ``itos``
+      Optional id-to-token table used only for error messages.
+
+  :class:`~llmcodec.vocab.Vocab` already satisfies this protocol.
+  """
+
+  @abstractmethod
+  def encode(self, text, add_bos=False, add_eos=False):
+    ...
+
+  @abstractmethod
+  def decode(self, ids, skip_special=False):
+    ...
+
+  @property
+  @abstractmethod
+  def vocab_size(self):
+    ...
+
+  @property
+  @abstractmethod
+  def bos_id(self):
+    ...
+
+  @property
+  @abstractmethod
+  def eos_id(self):
+    ...
+
+  @property
+  @abstractmethod
+  def unk_id(self):
+    ...
+
+
+class HFTokenizer:
+  """Wraps a Hugging Face ``PreTrainedTokenizerFast`` as a codec tokenizer.
+
+  BOS/EOS management stays with the codec exactly as in the character-level
+  path, so the wrapper requests plain encodings and clears any special ids
+  the tokenizer would have added itself.  Unk is typically ``None`` for
+  byte-level BPE tokenizers; the codec's unknown-input behaviour then comes
+  from the tokenizer's own byte fallback instead.
+
+  Attributes:
+    tokenizer: The wrapped fast tokenizer.
+    name: The tokenizer id or path it was loaded from.
+    revision: The requested revision, if any.
+    add_bos_token: Whether the underlying tokenizer adds BOS by default.
+  """
+
+  def __init__(self, tokenizer, name=None, revision=None, device=None):
+    """Wrap an already-loaded tokenizer.
+
+    Args:
+      tokenizer: A ``PreTrainedTokenizerFast`` (or compatible fast tokenizer).
+      name: The tokenizer id or path, kept for :meth:`describe`.
+      revision: The revision the tokenizer came from, if known.
+      device: Unused; accepted so call sites can pass the codec's device
+        uniformly.
+    """
+    del device  # tokenization is device-independent
+    self.tokenizer = tokenizer
+    self.name = name
+    self.revision = revision
+    self.add_bos_token = bool(getattr(tokenizer, "add_bos_token", False)) or \
+        getattr(tokenizer, "bos_token_id", None) in (
+            tokenizer.model_input_names or [])
+
+  def __getattr__(self, name):
+    """Pass attribute access through to the wrapped tokenizer.
+
+    This exposes ``bos_token_id``/``eos_token_id``/``unk_token_id`` and any
+    other attribute of the underlying tokenizer, which is how the codec
+    reaches ``bos_id``/``eos_id``/``unk_id``/``vocab_size`` without a forest
+    of forwarding properties.
+    """
+    return getattr(self.tokenizer, name)
+
+  def __getitem__(self, token_id):
+    """Expose ``itos``-style indexed access for error messages."""
+    return self.tokenizer.convert_ids_to_tokens(int(token_id))
+
+  def __iter__(self):
+    """Allow ``for c in vocab.itos``-style iteration for the char heuristic."""
+    return iter(self.tokenizer.convert_ids_to_tokens(range(len(self.tokenizer))))
+
+  def __len__(self):
+    """Size of the vocabulary, mirroring ``Vocab.__len__``."""
+    return self.vocab_size
+
+  @classmethod
+  def load(cls, name_or_path, revision=None, device=None):
+    """Load a tokenizer from the hub or a local path.
+
+    Args:
+      name_or_path: A tokenizer id, e.g. ``"gpt2"``, or a local path.
+      revision: Optional revision to pin.
+      device: Unused; accepted for call-site uniformity.
+
+    Returns:
+      An :class:`HFTokenizer`.
+
+    Raises:
+      ImportError: If the ``transformers`` package is not installed
+        (install it with ``pip install "llmcodec[hf]"``).
+    """
+    try:
+      from transformers import AutoTokenizer
+    except ImportError as exc:  # pragma: no cover - depends on extras
+      raise ImportError("Hugging Face tokenizers need the 'transformers' package; "
+                        "install it with: pip install \"llmcodec[hf]\"") from exc
+    kwargs = {}
+    if revision is not None:
+      kwargs["revision"] = revision
+    tokenizer = AutoTokenizer.from_pretrained(name_or_path, **kwargs)
+    return cls(tokenizer, name=name_or_path, revision=revision)
+
+  @property
+  def vocab_size(self):
+    """Size of the token id space the model's logits must cover.
+
+    ``len(tokenizer)`` rather than ``tokenizer.vocab_size``: the latter can
+    exclude *added* special tokens, whose ids are still valid inputs to the
+    model and must stay indexable into its distribution.
+    """
+    return len(self.tokenizer)
+
+  @property
+  def bos_id(self):
+    """The BOS id, or ``None`` when the tokenizer has none.
+
+    The codec requires a BOS to seed its prefix, so loading a tokenizer
+    without BOS fails at :meth:`load` time rather than at encode time.
+    """
+    return self.tokenizer.bos_token_id
+
+  @property
+  def eos_id(self):
+    """The EOS id, or ``None`` when the tokenizer has none."""
+    return self.tokenizer.eos_token_id
+
+  @property
+  def unk_id(self):
+    """The unk id, or ``None`` when the tokenizer has unknown tokens."""
+    return self.tokenizer.unk_token_id
+
+  @property
+  def pad_id(self):
+    """The pad id, or ``None`` when the tokenizer has no pad token."""
+    return self.tokenizer.pad_token_id
+
+  @property
+  def itos(self):
+    """Id-to-token strings, for error messages and the char heuristic.
+
+    Truncated to the tokenizer's true vocabulary; padded re-exported
+    tokenizers can report a padded ``len()`` greater than the real vocab.
+    """
+    size = self.vocab_size
+    return self.tokenizer.convert_ids_to_tokens(range(size))
+
+  def encode(self, text, add_bos=False, add_eos=False):
+    """Map ``text`` to a list of token ids.
+
+    Args:
+      text: The text to tokenize.
+      add_bos: Prepend the BOS id.  Unusable when the tokenizer has no BOS
+        (e.g. GPT-2); raise instead of silently encoding a wrong prefix.
+      add_eos: Append the EOS id.  Same constraint as ``add_bos``.
+
+    Returns:
+      The list of token ids, with any tokenizer-added special ids removed.
+    """
+    ids = self.tokenizer.encode(text, add_special_tokens=False)
+    if add_bos:
+      if self.bos_id is None:
+        raise ValueError("tokenizer has no bos token; the codec cannot seed its prefix")
+      ids = [self.bos_id] + ids
+    if add_eos:
+      if self.eos_id is None:
+        raise ValueError("tokenizer has no eos token; cannot append one")
+      ids = ids + [self.eos_id]
+    return ids
+
+  def decode(self, ids, skip_special=False):
+    """Map ids back to text via the tokenizer's own decoder.
+
+    Args:
+      ids: Token ids.
+      skip_special: Drop special tokens before decoding.
+
+    Returns:
+      The decoded string.
+    """
+    if skip_special:
+      special = {i for i in (self.bos_id, self.eos_id, self.unk_id) if i is not None}
+      ids = [i for i in ids if i not in special]
+    return self.tokenizer.decode(list(ids), skip_special_tokens=False)
+
+  def describe(self):
+    """Return a JSON-friendly description of the tokenizer configuration."""
+    return {
+        "type": "hf",
+        "name": self.name,
+        "revision": self.revision,
+        "vocab_size": self.vocab_size,
+    }
+
+
+__all__ = ["NextTokenModel", "HFCausalLM", "TokenCodec", "HFTokenizer", "load_hf_model"]

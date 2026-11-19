@@ -148,6 +148,11 @@ class TinyLM(nn.Module):
     x = self.ln_f(x)
     return self.lm_head(x)
 
+  @property
+  def vocab_size(self):
+    """Number of tokens in the vocabulary (matches ``config.vocab_size``)."""
+    return self.config.vocab_size
+
   @torch.no_grad()
   def next_token_probs(self, input_ids, amp_dtype=None):
     """Return the softmax next-token distribution for the last position.

@@ -29,29 +29,88 @@ from .candidates import build_selector
 from .codec import Codec, NotEncodableError
 from .interval import BitCode
 from .model import TinyLM
+from .pretrained import HFTokenizer
 from .train import add_train_arguments, config_from_args
 from .train import train as train_run
 from .vocab import DEFAULT_VOCAB
+
+DEFAULT_SELECTOR_BY_VOCAB = 1000
+
+
+def _load_tokenizer(args):
+  """Load the tokenizer requested by ``--tokenizer`` (default: built-in).
+
+  Args:
+    args: Parsed arguments; ``tokenizer`` may be absent (train subparser).
+
+  Returns:
+    A :class:`~llmcodec.vocab.Vocab` or an
+    :class:`~llmcodec.pretrained.HFTokenizer`.
+  """
+  name = getattr(args, "tokenizer", None)
+  if not name:
+    return DEFAULT_VOCAB
+  return HFTokenizer.load(name, device=getattr(args, "device", "auto"))
+
+
+def _load_codec_model(args):
+  """Load the model backend: an HF causal LM or a TinyLM checkpoint.
+
+  Args:
+    args: Parsed arguments carrying ``--model`` and the HF options.
+
+  Returns:
+    A :class:`~llmcodec.model.TinyLM` (nn.Module) or an
+    :class:`~llmcodec.pretrained.HFCausalLM`.
+
+  Raises:
+    ValueError: If both or neither of ``--model`` and ``--hf-model`` are
+      given.
+  """
+  hf_name = getattr(args, "hf_model", None)
+  if hf_name and getattr(args, "model", None):
+    raise ValueError("--model and --hf-model are mutually exclusive")
+  if hf_name:
+    from .pretrained import HFCausalLM
+
+    return HFCausalLM.load(hf_name,
+                           revision=getattr(args, "revision", None),
+                           dtype=getattr(args, "hf_dtype", "float32"),
+                           device=getattr(args, "device", "auto"))
+  if not getattr(args, "model", None):
+    raise ValueError("one of --model or --hf-model is required")
+  return TinyLM.load(args.model, map_location=getattr(args, "device", "auto"))
 
 
 def _make_codec(args):
   """Build a :class:`~llmcodec.codec.Codec` from parsed CLI arguments.
 
   Args:
-    args: Parsed arguments carrying ``--model`` and the selector options.
+    args: Parsed arguments carrying ``--model``, the tokenizer choice and
+      the selector options.
 
   Returns:
     A ready-to-use codec.
+
+  Raises:
+    ValueError: If the requested selector mode cannot serve the tokenizer,
+      for example the lossless ``full`` mode with a large vocabulary.
   """
   device = getattr(args, "device", "auto")
-  model = TinyLM.load(args.model, map_location=device)
+  model = _load_codec_model(args)
+  vocab = _load_tokenizer(args)
+  if args.mode == "full" and vocab.vocab_size >= DEFAULT_SELECTOR_BY_VOCAB:
+    raise ValueError(
+        f"the lossless 'full' selector needs one interval per token; with a "
+        f"vocabulary of {vocab.vocab_size} that is impractically slow -- "
+        "use '--mode adaptive' or '--mode topn' instead")
   selector = build_selector(
       args.mode,
       n=getattr(args, "n", 5),
       max_n=getattr(args, "max_n", 16),
       coverage=getattr(args, "coverage", 0.999),
   )
-  return Codec(model, DEFAULT_VOCAB, selector, device=device)
+  return Codec(model, vocab, selector, device=device)
 
 
 def _cmd_train(args):
@@ -204,6 +263,33 @@ def add_codec_args(parser):
       "--device",
       default="auto",
       help="torch device for inference: 'auto' (CUDA if available), 'cpu' or 'cuda'",
+  )
+  parser.add_argument(
+      "--tokenizer",
+      default=None,
+      help="Hugging Face tokenizer to use instead of the built-in character "
+      "vocabulary, e.g. 'gpt2' (with a matching HF model, or a TinyLM "
+      "trained with the same tokenizer)",
+  )
+  parser.add_argument(
+      "--hf-model",
+      default=None,
+      help="Hugging Face causal LM to use as the distribution source instead "
+      "of a trained checkpoint, e.g. 'gpt2' (mutually exclusive with "
+      "--model; requires the llmcodec[hf] extra)",
+  )
+  parser.add_argument(
+      "--revision",
+      default=None,
+      help="revision to pin when loading the HF model and tokenizer "
+      "(branch, tag or commit hash)",
+  )
+  parser.add_argument(
+      "--hf-dtype",
+      choices=["float32", "float16", "bfloat16", "auto"],
+      default="float32",
+      help="inference dtype for the HF model (default: float32 for "
+      "reproducibility; encode and decode must agree)",
   )
 
 

@@ -148,15 +148,38 @@ class Codec:
     self.device = resolve_device(device)
     self.amp_dtype = amp_dtype
     self.max_decode_len = max_decode_len
-    self.model.to(self.device)
-    self.model.eval()
+    if isinstance(self.model, torch.nn.Module):
+      self.model.to(self.device)
+      self.model.eval()
+    else:
+      # The wrapper manages its own device and evaluation mode (for example
+      # llmcodec.pretrained.HFCausalLM); do not assume an nn.Module.
+      if getattr(self.model, "device", None) is not None:
+        self.device = torch.device(self.model.device)
 
     if emittable_ids is None:
-      # Everything the message alphabet can contain: the character tokens plus
-      # <eos> and <unk>.  <pad>/<bos> are prompt-only and never emitted.
-      chars = {vocab.token_id(c) for c in vocab.itos if len(c) == 1}
-      emittable_ids = sorted(chars | {vocab.eos_id, vocab.unk_id})
+      token_id = getattr(vocab, "token_id", None)
+      if token_id is not None:
+        # Character-level vocabularies can emit every single-char token plus
+        # <eos> and <unk>.  <pad>/<bos> are prompt-only and never emitted.
+        chars = {token_id(c) for c in vocab.itos if len(c) == 1}
+        emittable_ids = sorted(chars | {vocab.eos_id, vocab.unk_id})
+      else:
+        # Subword vocabularies have no per-character table: every token is
+        # emittable except the prompt-only specials (<bos>/<pad>).
+        excluded = {
+            i for i in (vocab.bos_id, getattr(vocab, "pad_id", None)) if i is not None
+        }
+        emittable_ids = sorted(set(range(vocab.vocab_size)) - excluded)
     self.emittable_ids = tuple(emittable_ids)
+
+    model_size = getattr(model, "vocab_size", None)
+    if model_size is None:
+      model_size = getattr(getattr(model, "config", None), "vocab_size", None)
+    if model_size is not None and model_size != vocab.vocab_size:
+      raise ValueError(f"model vocabulary size {model_size} does not match tokenizer "
+                       f"vocabulary size {vocab.vocab_size}: the codec would index the "
+                       "distribution with ids from the wrong table")
 
   def _probs(self, prefix_ids):
     """Return the next-token distribution for ``prefix_ids`` as a numpy array.
