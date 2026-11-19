@@ -39,15 +39,25 @@ def _word_level_tokenizer(with_bos=True):
 
 
 def _hf_model(vocab_size=VOCAB_SIZE):
-  """Build a tiny random GPT-2 whose vocabulary matches the tokenizer."""
+  """Build a tiny random GPT-2 whose vocabulary matches the tokenizer.
+
+  Weights are seeded: tests like the topn/unk behaviour depend on where a
+  given token ranks in the distribution, and must not flip with the
+  initialization lottery.
+  """
   pytest.importorskip("transformers")
+  import torch
   from transformers import GPT2Config, GPT2LMHeadModel
 
+  torch.manual_seed(0)
   config = GPT2Config(vocab_size=vocab_size,
                       n_positions=16,
                       n_embd=32,
                       n_layer=2,
-                      n_head=4)
+                      n_head=4,
+                      bos_token_id=1,
+                      eos_token_id=2,
+                      pad_token_id=0)
   return HFCausalLM(GPT2LMHeadModel(config),
                     name="test-gpt2",
                     dtype="float32",
@@ -70,10 +80,30 @@ def test_hf_tokenizer_encode_adds_no_specials():
   assert tok.eos_id not in ids
 
 
+class _UnkIsRareModel:
+  """Deterministic model making ``<unk>`` too rare for any top-n cutoff.
+
+  The point of the test is the interaction between ``topn`` and the HF
+  tokenizer's error reporting, so the distribution is fixed by hand
+  instead of left to a random initialization.
+  """
+
+  vocab_size = VOCAB_SIZE
+  device = "cpu"
+
+  def next_token_probs(self, input_ids, amp_dtype=None):
+    del input_ids, amp_dtype
+    import torch
+    probs = torch.full((VOCAB_SIZE,), 0.01)
+    probs[SPECIALS.index("<unk>")] = 1e-6
+    probs[SPECIALS.index("<eos>")] = 0.08
+    return probs / probs.sum()
+
+
 def test_unknown_word_raises_under_topn_like_char_level():
   """``topn`` raises for out-of-vocabulary inputs, exactly as char-level."""
   tok = _word_level_tokenizer()
-  codec = Codec(_hf_model(), tok, build_selector("topn", n=8), device="cpu")
+  codec = Codec(_UnkIsRareModel(), tok, build_selector("topn", n=8), device="cpu")
   with pytest.raises(NotEncodableError, match="unk"):
     codec.encode("the zebra")
 
@@ -250,6 +280,28 @@ def test_tokenizer_without_bos_and_eos_is_rejected():
   codec = Codec(model, _NoSeed(), build_selector("topn", n=4), device="cpu")
   with pytest.raises(ValueError, match="neither <bos> nor <eos>"):
     codec.encode("abc")
+
+
+@pytest.mark.slow
+@pytest.mark.hf
+def test_gpt2_hub_roundtrip_with_adaptive():
+  """Full roundtrip through the real pretrained ``gpt2`` (network, slow).
+
+  This is the scenario that exposed the EOS gap: after a mid-document
+  sentence, pretrained GPT-2 assigns EOS so little probability that an
+  adaptive selector below full coverage drops it, and the codec could not
+  terminate.  With the EOS guarantee the encode must succeed.
+  """
+  pytest.importorskip("transformers")
+  model = HFCausalLM.load("gpt2", dtype="float32", device="cpu")
+  tok = HFTokenizer.load("gpt2")
+  codec = Codec(model,
+                tok,
+                build_selector("adaptive", max_n=2000, coverage=0.999),
+                device="cpu")
+  text = "The cat sat on the mat."
+  assert codec.decode(codec.encode(text).value) == text
+  assert codec.decode_bits(codec.encode_bits(text)) == text
 
 
 def test_load_codec_model_requires_exactly_one_source():

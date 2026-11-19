@@ -39,9 +39,10 @@ distribution, the decoder never needs to be told which tokens the encoder chose.
 from collections import namedtuple
 from fractions import Fraction
 
+import numpy as np
 import torch
 
-from .candidates import build_selector
+from .candidates import WEIGHT_SCALE, CandidateSet, build_selector
 from .device import resolve_device
 from .interval import BitCode, Interval
 
@@ -219,13 +220,40 @@ class Codec:
   def _candidates(self, probs):
     """Return the candidate set for a distribution.
 
+    The end-of-sequence token is always part of the set: if the selector
+    left it out (a strong model can assign the sentence-final ``<eos>``
+    less probability than a selector's coverage cutoff), it is appended
+    with its true quantized probability.  Without this guarantee the codec
+    could fail mid-decode, unable to place ``<eos>`` no matter how the
+    selector is configured.
+
+    The guarantee is a no-op whenever EOS is already covered, so sets that
+    the plain selectors produce are never modified.
+
     Args:
       probs: The next-token probability vector.
 
     Returns:
-      The :class:`~llmcodec.candidates.CandidateSet` chosen by the selector.
+      The :class:`~llmcodec.candidates.CandidateSet` chosen by the selector,
+      with EOS guaranteed to be part of it.
+
+    Raises:
+      ValueError: If the selector omitted EOS and it has no usable
+        probability in the distribution.
     """
-    return self.selector.select(probs, self.emittable_ids)
+    candidates = self.selector.select(probs, self.emittable_ids)
+    eos_id = self.vocab.eos_id
+    if eos_id is None or candidates.index_of(eos_id) is not None:
+      return candidates
+    weight = int(np.rint(probs[eos_id] * WEIGHT_SCALE))
+    if weight < 1:
+      # A selector that drops EOS has implicitly claimed the probability
+      # mass; take the smallest share that keeps the interval arithmetic
+      # well defined, so termination stays possible even for p(EOS) = 0.
+      weight = 1
+    token_ids = list(candidates.token_ids) + [eos_id]
+    weights = list(candidates.weights) + [weight]
+    return CandidateSet(token_ids, weights)
 
   def _not_encodable(self, token_id, position, candidate_ids):
     """Build a :class:`NotEncodableError` with human-readable token text.

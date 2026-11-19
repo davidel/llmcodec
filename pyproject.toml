@@ -65,6 +65,7 @@ pythonpath = ["src"]
 addopts = "-q"
 markers = [
     "slow: tests that train a model or require the network",
+    "hf: tests that download pretrained Hugging Face artifacts (also slow)",
 ]
 
 [tool.coverage.run]

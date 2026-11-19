@@ -545,7 +545,11 @@ from llmcodec.pretrained import HFCausalLM, HFTokenizer
 
 model = HFCausalLM.load("gpt2", dtype="float32", device="auto")
 vocab = HFTokenizer.load("gpt2")
-codec = Codec(model, vocab, build_selector("adaptive", max_n=32))
+# Lossless: cover the whole vocabulary at full coverage so no content
+# token can fall outside the candidate set (see examples/pretrained_hf.py).
+codec = Codec(model, vocab,
+              build_selector("adaptive", max_n=vocab.vocab_size,
+                             coverage=1.0))
 enc = codec.encode("The cat sat on the mat.")
 print(enc.value)                 # exact Fraction in [0, 1]
 print(codec.decode(enc.value))   # the original text
@@ -583,10 +587,28 @@ a drifted vocabulary fails loudly instead of producing garbage.  Pass
 
 - Vocabularies of 1000+ tokens must use `--mode adaptive` (or `topn`);
   the lossless `full` selector is rejected at that size.
+- For lossless encoding of arbitrary text, set `--coverage 1.0` and a
+  `--max-n` covering the vocabulary (that is the `pretrained_hf.py`
+  default): with the usual `0.999` even a *content* token can fall
+  outside the candidate set after an unpredictable prefix.  The
+  end-of-sequence guarantee keeps termination possible either way.
 - For large vocabularies prefer `encode-bits`/`decode-bits`: the dyadic
   bit code avoids the deep-nesting penalty of `Fraction` intervals.
-- With GPT-2-class models expect roughly 0.9-1.0 bits per character,
-  versus about 2.5-3 for the built-in character-level TinyLM.
+- Measured with `gpt2` on the `pretrained_hf.py` demo sentences: about
+  1.5-2.3 bits per character (short sentences give the model little
+  context); longer, more predictable text trends toward ~1 bit per
+  character.  The built-in character-level TinyLM is noticeably worse.
+
+### End-of-sequence guarantee
+
+The codec always keeps ``<eos>`` available: if a selector drops it
+(because a strong model assigns the sentence-final ``<eos>`` less
+probability than a top-n or coverage cutoff), the codec appends it with
+its true quantized probability.  The guarantee is a no-op whenever the
+selector already covered EOS, so existing codes are unchanged -- and
+with pretrained models the encode can no longer fail with
+"token ``<eos>`` has no slice" at the last step.  This is exercised
+against the real ``gpt2`` checkpoint by the ``hf``-marked tests.
 
 ## Python API
 
@@ -611,7 +633,9 @@ print(codec.decode_bits(bits))  # 'the cat sat on the mat.'
 ```
 
 See [`examples/encode_decode.py`](examples/encode_decode.py) for a runnable demo
-(which trains a tiny model on the offline corpus if you don't pass a checkpoint).
+(which trains a tiny model on the offline corpus if you don't pass a checkpoint),
+and [`examples/pretrained_hf.py`](examples/pretrained_hf.py) for the same thing
+with a pretrained Hugging Face model and tokenizer (requires `.[hf]`).
 
 ## CLI reference
 
@@ -693,7 +717,7 @@ src/llmcodec/
   codec.py        # the arithmetic encoder/decoder
   cli.py          # llmcodec train|encode|decode|roundtrip
 tests/            # pytest suite
-examples/         # runnable demo
+examples/         # runnable demos (offline + pretrained HF)
 configs/          # example training config
 ```
 
